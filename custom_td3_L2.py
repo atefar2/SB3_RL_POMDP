@@ -159,32 +159,17 @@ class CustomTD3(TD3):
                 a_next = self.actor(next_obs)
 
                 # maximize Q(s,a) → minimize −Q
-                q_values = -self.critic.q1_forward(obs, a_cur) #.mean()
-                
-                # --- Create a weight (0-1) from Q-values ---
-                # Use tanh to squash values. High Q -> low penalty_weight
-                # The '5.0' is a temperature parameter you can tune.
-                penalty_weights = 1.0 - torch.tanh(5.0 * q_values).clamp(min=0)
-
-                # --- Calculate actor loss ---
-                actor_loss = -q_values.mean()
-                
+                actor_loss = -self.critic.q1_forward(obs, a_cur).mean()
 
                 # ─── add temporal‐difference smoothness term ───
                 # L2 regularizer on the action change between π(s_t) and π(s_{t+1})
                 # penalize big jumps between π(s_t) and π(s_{t+1})
-                # smooth_loss = self.action_reg_coef * (
-                #     (a_next - a_cur)
-                #     .pow(2)
-                #     .sum(dim=1)
-                #     .mean()
-                # )
-
-                # --- Calculate smooth loss ---
-                # Penalize large changes in action between consecutive states
                 smooth_loss = self.action_reg_coef * (
-                    penalty_weights * (a_next - a_cur).pow(2).sum(dim=1)
-                ).mean()                
+                    (a_next - a_cur)
+                    .pow(2)
+                    .sum(dim=1)
+                    .mean()
+                )
                 
                 actor_loss = actor_loss + smooth_loss
                 actor_losses.append(actor_loss.item())

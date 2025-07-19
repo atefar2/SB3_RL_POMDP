@@ -29,7 +29,8 @@ class CustomTD3(TD3):
         self,
         policy: Union[str, Type[TD3Policy]],
         env: Union[GymEnv, str],
-        # ────── removed action_reg_coef parameter ──────
+        # ────── new hyperparameter ──────
+        action_reg_coef: float = 0.1, # orginal0.1,
         learning_rate: Union[float, Schedule] = 1e-4,
         buffer_size: int = 1_000_000,  # 1e6
         learning_starts: int = 100,
@@ -55,8 +56,8 @@ class CustomTD3(TD3):
         max_grad_norm: float = 1.0,
     ):
         # Store our custom args
-        self.max_grad_norm = max_grad_norm
-        # Removed: self.action_reg_coef = action_reg_coef
+        self.max_grad_norm    = max_grad_norm
+        self.action_reg_coef  = action_reg_coef
 
         super().__init__(
             policy=policy,
@@ -85,42 +86,32 @@ class CustomTD3(TD3):
         )
 
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
-        """Enhanced training loop with entropy regularization for POMDP rewards."""
-        
-        # Check if environment uses POMDP reward for entropy regularization
-        env_reward_type = 'simple'  # Default fallback
-        
-        # Try different ways to access the underlying environment
-        if hasattr(self.env, 'envs') and hasattr(self.env.envs[0], 'reward_type'):
-            env_reward_type = getattr(self.env.envs[0], 'reward_type', 'simple')
-        elif hasattr(self.env, 'env') and hasattr(self.env.env, 'reward_type'):
-            env_reward_type = getattr(self.env.env, 'reward_type', 'simple')
-        elif hasattr(self.env, 'reward_type'):
-            env_reward_type = getattr(self.env, 'reward_type', 'simple')
-        
-        use_entropy_reg = env_reward_type == "POMDP"  # Only use entropy for POMDP
-        
-        # Debug logging to confirm detection (only log once per training session)
-        if not hasattr(self, '_reward_type_logged'):
-            print(f"🔧 CustomTD3: Detected reward_type='{env_reward_type}'")
-            if use_entropy_reg:
-                print(f"🎯 POMDP Mode: Using entropy regularization for exploration")
-            else:
-                print(f"📈 Standard Mode: No additional regularization")
-            self._reward_type_logged = True
-        
-        # Switch to train mode
+        """
+        Override the default training loop to use Huber loss for the critic
+        and apply gradient clipping.
+        """
+        # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
+
+        # Update learning rate according to schedule
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
         actor_losses, critic_losses = [], []
         for _ in range(gradient_steps):
             self._n_updates += 1
+            # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
+            # with torch.no_grad():
+            #     # Select action according to policy and add clipped noise
+            #     noise = replay_data.actions.clone().data.normal_(0, self.target_policy_noise)
+            #     noise = noise.clamp(-self.target_noise_clip, self.target_noise_clip)
+            #     next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
+
             with torch.no_grad():
+                # ✅ Correct: sample fresh Gaussian noise shaped by action_dim
                 batch_size = replay_data.next_observations.shape[0]
-                action_dim = self.action_space.shape[0]
+                action_dim = self.action_space.shape[0] #action_dim = self.actor.action_dim  # Infer from actor
                 device = self.device
 
                 noise = torch.normal(
@@ -130,44 +121,78 @@ class CustomTD3(TD3):
                     device=device
                 ).clamp(-self.target_noise_clip, self.target_noise_clip)
 
-                next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
+                next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)            
+
+
+                # Compute the target Q value
                 target_q_values = torch.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
                 target_q_values, _ = torch.min(target_q_values, dim=1, keepdim=True)
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * target_q_values
 
-            # Critic update (same as before)
+            # Get current Q-values estimates
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
+
+            # ✅ HUBER LOSS: Compute critic loss using smooth_l1_loss (Huber loss)
+            # This is less sensitive to outliers than the default MSE loss.
             critic_loss = sum(F.smooth_l1_loss(current_q, target_q_values) for current_q in current_q_values)
             critic_losses.append(critic_loss.item())
 
+            # Optimize the critic
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
+            # ✅ GRADIENT CLIPPING: Clip the gradients to prevent explosions
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.critic.optimizer.step()
 
-            # Actor update - CLEAN VERSION WITHOUT L2 REGULARIZATION
+            # Delayed policy updates
             if self._n_updates % self.policy_delay == 0:
-                obs = replay_data.observations
-                a_cur = self.actor(obs)
+                # OLD:
+                # Compute actor loss
+                # actor_loss = -self.critic.q1_forward(replay_data.observations, self.actor(replay_data.observations)).mean()
+
+
+                # ─── Standard TD3 actor objective ───
+                obs      = replay_data.observations
+                next_obs = replay_data.next_observations
+
+                a_cur  = self.actor(obs)
+                a_next = self.actor(next_obs)
+
+                # maximize Q(s,a) → minimize −Q
+                q_values = -self.critic.q1_forward(obs, a_cur) #.mean()
                 
-                # Standard TD3 actor objective
-                actor_loss = -self.critic.q1_forward(obs, a_cur).mean()
+                # --- Create a weight (0-1) from Q-values ---
+                # Use tanh to squash values. High Q -> low penalty_weight
+                # The '5.0' is a temperature parameter you can tune.
+                penalty_weights = 1.0 - torch.tanh(5.0 * q_values).clamp(min=0)
+
+                # --- Calculate actor loss ---
+                actor_loss = -q_values.mean()
                 
-                # Optional entropy regularization for POMDP only
-                # if use_entropy_reg:
-                # Encourage exploration through entropy bonus
-                action_log_probs = torch.distributions.Normal(a_cur, 0.1).log_prob(a_cur).sum(dim=1)
-                entropy_bonus = 0.01 * action_log_probs.mean()  # Small entropy bonus
-                actor_loss = actor_loss - entropy_bonus  # Subtract because we want to maximize entropy
+
+                # ─── add temporal‐difference smoothness term ───
+                # L2 regularizer on the action change between π(s_t) and π(s_{t+1})
+                # penalize big jumps between π(s_t) and π(s_{t+1})
+                # smooth_loss = self.action_reg_coef * (
+                #     (a_next - a_cur)
+                #     .pow(2)
+                #     .sum(dim=1)
+                #     .mean()
+                # )
+
+                # --- Calculate smooth loss ---
+                # Penalize large changes in action between consecutive states
+                smooth_loss = self.action_reg_coef * (
+                    penalty_weights * (a_next - a_cur).pow(2).sum(dim=1)
+                ).mean()                
                 
-                # Periodic debug logging for entropy regularization
-                if self._n_updates % 1000 == 0:
-                    print(f"🎯 POMDP Entropy Regularization Applied: entropy_bonus={entropy_bonus.item():.6f}")
-                
+                actor_loss = actor_loss + smooth_loss
                 actor_losses.append(actor_loss.item())
 
+                # Optimize the actor
                 self.actor.optimizer.zero_grad()
                 actor_loss.backward()
+                # ✅ GRADIENT CLIPPING: Clip the gradients for the actor as well
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 self.actor.optimizer.step()
 

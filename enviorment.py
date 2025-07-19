@@ -720,31 +720,31 @@ class PortfolioEnv(gym.Env):
             else:
                 risk_adjusted_reward = 0.0
             
-            # 3. ALLOCATION CONSISTENCY REWARD
-            # Reward for maintaining allocations when they're working
-            # (This replaces the need for L2 regularization)
+            # 3. ALLOCATION CONSISTENCY REWARD (REBALANCED)
+            # Small reward for reasonable allocation changes, but shouldn't dominate base returns
             consistency_reward = 0.0
             if (hasattr(self, 'previous_money_split_ratio') and 
                 self.previous_money_split_ratio is not None):
                 
                 allocation_change = np.sum(np.abs(current_allocation - np.array(self.previous_money_split_ratio)))
                 
-                # NEW APPROACH: Always incentivize smoother allocations, with bonus for profitable periods
-                # Base consistency reward (always applied)
-                base_consistency = max(0, (1.0 - allocation_change)) * 0.01  # Reward smaller changes
-                
-                # Bonus for stability during profitable periods
+                # REBALANCED APPROACH: Much smaller scale, only reward when profitable
+                base_consistency = 0.0
                 stability_bonus = 0.0
+                
                 if len(self.return_history) > 0:
                     last_return = list(self.return_history)[-1] if self.return_history else 0
-                    if last_return > 0:
-                        # Extra reward for being stable when profitable
-                        stability_bonus = max(0, (0.5 - allocation_change)) * 0.01
+                    
+                    # Only provide consistency reward during profitable periods
+                    if last_return > 0.001:  # Only when actually profitable
+                        # Much smaller scale: 0.001 instead of 0.01 (10x smaller)
+                        base_consistency = max(0, (1.0 - allocation_change)) * 0.001
+                        stability_bonus = max(0, (0.5 - allocation_change)) * 0.0005
                 
                 consistency_reward = base_consistency + stability_bonus
                 
                 # Debug output for consistency reward
-                if allocation_change < 0.5:  # Only log when there's potential for reward
+                if consistency_reward > 0:  # Only log when there's actual reward
                     print(f"🔄 Consistency: change={allocation_change:.3f}, base={base_consistency:.4f}, bonus={stability_bonus:.4f}, total={consistency_reward:.4f}")
 
             # 4. MOMENTUM REWARD

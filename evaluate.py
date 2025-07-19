@@ -597,7 +597,7 @@ if __name__ == '__main__':
         # "models/TD3_tf_agents_style_heavy_STRUCTURED_CREDIT_20250714_194641/checkpoints/model_57200_steps.zip"
         # "models/TD3_tf_agents_style_heavy_STRUCTURED_CREDIT_20250714_153933/checkpoints/model_62800_steps.zip"
 
-        "models/TD3_tf_agents_style_heavy_POMDP_20250719_152048/checkpoints/model_2400_steps.zip"
+        "models/TD3_tf_agents_style_heavy_POMDP_20250719_152048/checkpoints/model_4000_steps.zip"
     ]
     
     # Check which models exist
