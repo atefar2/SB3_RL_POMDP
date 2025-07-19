@@ -518,7 +518,7 @@ class PortfolioEnv(gym.Env):
         
         # --- NEW: Calculate Total Variation Penalty to prevent thrashing ---
         tv_penalty = 0.0
-        if len(self.tv_alloc_history) >= config.TV_WINDOW + 1:
+        if self.reward_type != "POMDP" and len(self.tv_alloc_history) >= config.TV_WINDOW + 1:
             total_variation = 0.0
             for i in range(1, len(self.tv_alloc_history)):
                 prev = np.array(self.tv_alloc_history[i - 1])
@@ -531,6 +531,9 @@ class PortfolioEnv(gym.Env):
             
             if tv_penalty > 1e-5:
                 print(f"🌀 Total Variation Penalty: {tv_penalty:.5f}")
+        elif self.reward_type == "POMDP":
+            # For POMDP, we want to allow differential allocations without penalty
+            tv_penalty = 0.0
 
         # ✅ REWARD CALCULATION: Choose between Simple Return or Net Return (Profit minus Costs)
         if self.reward_type == "STRUCTURED_CREDIT":
@@ -686,22 +689,43 @@ class PortfolioEnv(gym.Env):
             else:
                 step_return = 0.0
             
-            # 1. IMMEDIATE DIVERSIFICATION REWARD
-            # Reward for maintaining balanced allocations (proxy for good strategy)
+            # 1. DIFFERENTIAL ALLOCATION REWARD (REPLACES DIVERSITY)
+            # Reward smart allocation decisions rather than forced diversification
             current_allocation = np.array(self.money_split_ratio)
             if self.use_variable_portfolio:
                 active_allocation = current_allocation[:self.n_episode_coins + 1]
             else:
                 active_allocation = current_allocation
             
-            # Calculate entropy of allocation (higher = more diversified)
-            # Avoid log(0) by adding small epsilon
-            eps = 1e-8
-            normalized_alloc = active_allocation + eps
-            normalized_alloc = normalized_alloc / np.sum(normalized_alloc)
-            diversity_score = -np.sum(normalized_alloc * np.log(normalized_alloc))
-            max_diversity = np.log(len(normalized_alloc))  # Maximum possible entropy
-            diversity_reward = (diversity_score / max_diversity) * 0.02  # Scale to reasonable range
+            # Encourage differential allocation strategies
+            differential_reward = 0.0
+            
+            # Small baseline reward for reasonable allocation spread
+            # (prevents extreme all-in strategies but allows 0% allocations)
+            non_zero_assets = np.sum(active_allocation > 0.05)  # Assets with >5% allocation
+            if non_zero_assets >= 2:  # At least 2 assets with meaningful allocation
+                baseline_reward = 0.005  # Much smaller than old diversity reward
+            else:
+                baseline_reward = 0.0  # No reward for extreme concentration
+            
+            # Bonus for responsive allocation changes based on recent performance
+            responsiveness_bonus = 0.0
+            if (hasattr(self, 'previous_money_split_ratio') and 
+                self.previous_money_split_ratio is not None and
+                len(self.return_history) > 0):
+                
+                last_return = list(self.return_history)[-1] if self.return_history else 0
+                allocation_change = np.sum(np.abs(active_allocation - np.array(self.previous_money_split_ratio[:len(active_allocation)])))
+                
+                # Reward significant changes when losing money (adaptation)
+                if last_return < -0.005 and allocation_change > 0.1:
+                    responsiveness_bonus = min(0.01, allocation_change * 0.05)
+                
+                # Reward maintaining good allocations when profitable
+                elif last_return > 0.005 and allocation_change < 0.05:
+                    responsiveness_bonus = 0.005
+            
+            differential_reward = baseline_reward + responsiveness_bonus
             
             # 2. IMMEDIATE RISK-ADJUSTED REWARD  
             # Calculate immediate Sharpe-like ratio using recent returns
@@ -720,32 +744,27 @@ class PortfolioEnv(gym.Env):
             else:
                 risk_adjusted_reward = 0.0
             
-            # 3. ALLOCATION CONSISTENCY REWARD (REBALANCED)
-            # Small reward for reasonable allocation changes, but shouldn't dominate base returns
+            # 3. ALLOCATION CONSISTENCY REWARD (MINIMAL & CONDITIONAL)
+            # Very small reward for reasonable changes, only during strong profitability
             consistency_reward = 0.0
             if (hasattr(self, 'previous_money_split_ratio') and 
                 self.previous_money_split_ratio is not None):
                 
                 allocation_change = np.sum(np.abs(current_allocation - np.array(self.previous_money_split_ratio)))
                 
-                # REBALANCED APPROACH: Much smaller scale, only reward when profitable
-                base_consistency = 0.0
-                stability_bonus = 0.0
-                
+                # MINIMAL APPROACH: Only reward consistency during strong profit periods
                 if len(self.return_history) > 0:
                     last_return = list(self.return_history)[-1] if self.return_history else 0
                     
-                    # Only provide consistency reward during profitable periods
-                    if last_return > 0.001:  # Only when actually profitable
-                        # Much smaller scale: 0.001 instead of 0.01 (10x smaller)
-                        base_consistency = max(0, (1.0 - allocation_change)) * 0.001
-                        stability_bonus = max(0, (0.5 - allocation_change)) * 0.0005
-                
-                consistency_reward = base_consistency + stability_bonus
+                    # Only during strong profitability (much higher threshold)
+                    if last_return > 0.01:  # Only when return > 1%
+                        # Extremely small scale: 0.0005 instead of 0.001 (2x smaller again)
+                        base_consistency = max(0, (1.0 - allocation_change)) * 0.0005
+                        consistency_reward = base_consistency
                 
                 # Debug output for consistency reward
                 if consistency_reward > 0:  # Only log when there's actual reward
-                    print(f"🔄 Consistency: change={allocation_change:.3f}, base={base_consistency:.4f}, bonus={stability_bonus:.4f}, total={consistency_reward:.4f}")
+                    print(f"🔄 Consistency: change={allocation_change:.3f}, reward={consistency_reward:.6f}")
 
             # 4. MOMENTUM REWARD
             # Reward for following profitable trends (immediate signal for long-term thinking)
@@ -772,7 +791,7 @@ class PortfolioEnv(gym.Env):
 
             # 5. COMBINE ALL COMPONENTS
             base_reward = step_return  # Core return signal
-            enhancement_reward = (diversity_reward + risk_adjusted_reward + 
+            enhancement_reward = (differential_reward + risk_adjusted_reward + 
                                  consistency_reward + momentum_reward)
             
             raw_reward = base_reward + enhancement_reward + self.long_term_bonus
@@ -784,7 +803,7 @@ class PortfolioEnv(gym.Env):
             if (abs(enhancement_reward) > 1e-5 or abs(self.long_term_bonus) > 1e-5):
                 print(f"🎯 POMDP Reward Breakdown:")
                 print(f"   Base Return: {base_reward:.4f}")
-                print(f"   Diversity: {diversity_reward:.4f}")
+                print(f"   Differential: {differential_reward:.4f}")
                 print(f"   Risk-Adj: {risk_adjusted_reward:.4f}")  
                 print(f"   Consistency: {consistency_reward:.4f}")
                 print(f"   Momentum: {momentum_reward:.4f}")
