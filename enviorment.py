@@ -200,7 +200,7 @@ class PortfolioEnv(gym.Env):
         self.agent_allocation_history = [self.money_split_ratio.copy()] if hasattr(self, 'money_split_ratio') else []
         
         # 🔧 NEW: Initialize EWM tracking for POMDP smooth state transitions
-        self.ewm_alpha = 0.1  # EWM decay factor (0.1 = slow adaptation, 0.9 = fast adaptation)
+        self.ewm_alpha = 0.05  # EWM decay factor (0.1 = slow adaptation, 0.9 = fast adaptation)
         self.ewm_returns = None  # EWM of returns for directional understanding
         self.ewm_volatility = None  # EWM of volatility for risk assessment
         self.ewm_l2_penalty = None  # EWM of L2 penalty for smoothness
@@ -216,7 +216,7 @@ class PortfolioEnv(gym.Env):
         self.return_history = deque(maxlen=config.LONG_TERM_LOOKBACK)
 
         # --- NEW: History for Total Variation thrashing penalty ---
-        self.tv_alloc_history = [self.money_split_ratio.copy()]
+        # self.tv_alloc_history = [self.money_split_ratio.copy()]
         
         # Get observations
         scaled_output = self.get_observations()
@@ -317,7 +317,8 @@ class PortfolioEnv(gym.Env):
 
         # Prune history to the maximum required lookback window (for Shapley, TV, etc.)
         # This ensures all dependent calculations have enough data.
-        max_lookback = self.shapley_lookback + 1
+        max_lookback = max(self.shapley_lookback, config.TV_WINDOW, config.DRAWDOWN_WINDOW) + 1
+        
         if len(self.agent_allocation_history) > max_lookback:
             self.agent_allocation_history = self.agent_allocation_history[-max_lookback:]
 
@@ -463,11 +464,6 @@ class PortfolioEnv(gym.Env):
         # but before calculating costs. This is the new "actual" allocation.
         new_money_split_ratio = self.normalize_money_dist()
 
-        # --- NEW: Update Total Variation history ---
-        self.tv_alloc_history.append(new_money_split_ratio.copy())
-        if len(self.tv_alloc_history) > config.TV_WINDOW + 1:
-            self.tv_alloc_history = self.tv_alloc_history[-(config.TV_WINDOW + 1):]
-
         # Calculate transaction costs for Net Return (Profit minus Costs)
         transaction_cost = 0.0
         volatility_penalty = 0.0 # Initialize volatility penalty
@@ -538,9 +534,7 @@ class PortfolioEnv(gym.Env):
         self.return_history.append(step_return)
         
         # --- Store history for structured rewards & Shapley values ---
-        # The allocation to store is the one the agent decided on for this step
-        if len(self.agent_allocation_history) > self.shapley_lookback:
-            self.agent_allocation_history.pop(0)
+        # Note: agent_allocation_history is now managed centrally in step() method
 
         # Store current prices for the lookback calculation
         current_prices = self.dfslice[["coin", "open"]].set_index("coin").to_dict().get("open", {})
@@ -550,34 +544,33 @@ class PortfolioEnv(gym.Env):
         
         # --- NEW: Calculate Total Variation Penalty to prevent thrashing ---
         tv_penalty = 0.0
+        
         if len(self.agent_allocation_history) >= config.TV_WINDOW + 1:
             total_variation = 0.0
             # Use the agent's actual decision history for TV calculation
             windowed_history = self.agent_allocation_history[-(config.TV_WINDOW + 1):]
-            
+              
             for i in range(1, len(windowed_history)):
                 prev = np.array(windowed_history[i - 1])
                 curr = np.array(windowed_history[i])
                 
-                # ✅ CORRECTED: Use mean instead of sum to make penalty independent of portfolio size.
-                # This ensures the jitter penalty is an "average change per asset," which is a
-                # much fairer and more robust metric, just like we did for the L2 penalty.
-                abs_diff = np.abs(curr - prev)
+                # ✅ FIXED: Use L2 (squared differences) instead of L1 (absolute differences)
+                squared_diff = (curr - prev) ** 2
                 if self.use_variable_portfolio:
                     # For variable portfolios, only consider active assets for a fair comparison
-                    active_diff = abs_diff[:self.n_episode_coins + 1]
-                    mean_diff = np.mean(active_diff)
+                    active_diff = squared_diff[:self.n_episode_coins + 1]
+                    mean_squared_diff = np.mean(active_diff)
                 else:
-                    mean_diff = np.mean(abs_diff)
+                    mean_squared_diff = np.mean(squared_diff)
                 
-                total_variation += mean_diff
+                total_variation += mean_squared_diff
             
-            # Normalize by window size to get average change per step
+            # Normalize by window size to get average squared change per step
             avg_variation = total_variation / config.TV_WINDOW
             tv_penalty = config.TV_WEIGHT * avg_variation
             
             if tv_penalty > 1e-5:
-                print(f"🌀 Total Variation Jitter Penalty: {tv_penalty:.5f}")
+                print(f"🌀 Total Variation L2 Penalty: {tv_penalty:.5f}")
 
         # ✅ REWARD CALCULATION: Choose between Simple Return or Net Return (Profit minus Costs)
         if self.reward_type == "STRUCTURED_CREDIT":
@@ -1159,9 +1152,9 @@ class PortfolioEnv(gym.Env):
         augmented_features = []
         
         # 1. Recent allocation history (last 3 steps)
-        allocation_window = min(3, len(self.tv_alloc_history))
+        allocation_window = min(3, len(self.agent_allocation_history))
         if allocation_window > 0:
-            recent_allocations = self.tv_alloc_history[-allocation_window:]
+            recent_allocations = self.agent_allocation_history[-allocation_window:]
             # Flatten and pad to fixed size
             flattened = np.concatenate(recent_allocations).flatten()
             target_size = 3 * (self.n_episode_coins + 1)  # 3 steps * allocation size

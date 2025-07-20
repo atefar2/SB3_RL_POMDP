@@ -2815,11 +2815,137 @@ In short, the EWM implementation forces the agent to "zoom out" and see the bigg
 
 
 # -----------------------------------------------------------
-I want a new Addition to --reward-type Instead of TRANSACTION_COST i want 
---reward-type POMDP
+Of course. Here is a complete breakdown of the POMDP reward function, written in LaTeX. This document explains the teleological purpose and mathematical formulation of each component, based on the logic in your `enviorment.py` file.
 
-for --reward-type POMDP instead of just using step_reward
+***
 
+### **The POMDP-Aware Reward Function**
 
-issue? 
-allocation_changes = np.sum(np.abs(np.array(self.money_split_ratio) - np.array(self.previous_money_split_ratio)))
+The total reward function is designed to provide a rich, multi-faceted signal that guides the agent toward sophisticated, stable, and profitable trading behavior. It augments the basic return signal with several enhancement terms that account for risk, consistency, momentum, and long-term performance.
+
+The final clipped reward at timestep \(t\), denoted \( R_{\text{final}, t} \), is calculated as follows:
+
+\[
+R_{\text{final}, t} = \text{clip}(R_{\text{raw}, t}, -0.1, 0.1)
+\]
+
+Where the raw reward, \( R_{\text{raw}, t} \), is a composite of several distinct components:
+
+\[
+R_{\text{raw}, t} = \underbrace{R_{\text{base}, t}}_{\text{Base Return}} + \underbrace{R_{\text{enhance}, t}}_{\text{POMDP Enhancements}} + \underbrace{R_{\text{longterm}, t}}_{\text{Long-Term Bonus}} - \underbrace{P_{\text{jitter}, t}}_{\text{Jitter Penalty}}
+\]
+
+Let's break down each term.
+
+---
+
+### **1. Core Reward Signal: Base Return (\( R_{\text{base}, t} \))**
+
+This is the most fundamental reward component, representing the immediate, single-step change in portfolio value.
+
+**Purpose:** To provide a direct, dense signal of profitability.
+
+**Formula:**
+\[
+R_{\text{base}, t} = \frac{V_t - V_{t-1}}{V_{t-1}}
+\]
+where \( V_t \) is the total portfolio value at timestep \( t \).
+
+---
+
+### **2. POMDP State Enhancement Reward (\( R_{\text{enhance}, t} \))**
+
+This is a summation of several sophisticated reward signals designed to make the partially observable state more explicit to the agent. It encourages intelligent, non-obvious behaviors.
+
+**Formula:**
+\[
+R_{\text{enhance}, t} = R_{\text{diff}, t} + R_{\text{credit}, t} + R_{\text{risk}, t} + R_{\text{consist}, t} + R_{\text{momentum}, t}
+\]
+
+#### **a. Differential Reward (\( R_{\text{diff}, t} \))**
+A small, constant reward for maintaining a diversified portfolio.
+
+**Purpose:** To discourage the agent from collapsing its entire portfolio into a single asset (including cash) and encourage exploration.
+
+**Formula:**
+\[
+R_{\text{diff}, t} = \begin{cases} 0.005 & \text{if } |\left\{i \mid w_{t,i} > 0.05\right\}| \ge 2 \\ 0 & \text{otherwise} \end{cases}
+\]
+where \( w_{t,i} \) is the weight of asset \(i\) in the agent's target allocation at time \(t\).
+
+#### **b. Structured Credit Assignment Reward (\( R_{\text{credit}, t} \))**
+This reward fairly attributes portfolio performance to the agent's average allocation decisions over a lookback window \(N\).
+
+**Purpose:** To teach the agent the long-term value of its strategic allocations and the opportunity cost of holding cash.
+
+**Formula:**
+\[
+R_{\text{credit}, t} = \left( \sum_{i=1}^{M} \bar{w}_{i} P_{i} \right) + \bar{w}_{0} \cdot \max\left(-\frac{1}{M}\sum_{i=1}^{M} P_{i}, 0\right)
+\]
+where:
+- \(\bar{w}_i\) is the agent's average allocation to asset \(i\) over the lookback window \(N\).
+- \(M\) is the number of risky assets.
+- \(P_i\) is the risk-adjusted performance (squashed Sharpe Ratio) of asset \(i\) over the window \(N\).
+
+#### **c. Risk-Adjusted Reward (\( R_{\text{risk}, t} \))**
+A reward based on the Exponentially Weighted Moving Average (EWM) of the Sharpe Ratio.
+
+**Purpose:** To encourage the agent to maximize returns while minimizing volatility, based on a smoothed, longer-term view of performance.
+
+**Formula:**
+\[
+R_{\text{risk}, t} = 0.01 \cdot \tanh\left( \frac{\bar{r}^{\text{ewm}}_t}{\bar{\sigma}^{\text{ewm}}_t + \epsilon} \right)
+\]
+where \(\bar{r}^{\text{ewm}}_t\) is the EWM of returns and \(\bar{\sigma}^{\text{ewm}}_t\) is the EWM of volatility.
+
+#### **d. Consistency Reward (Temporal Smoothness) (\( R_{\text{consist}, t} \))**
+A penalty proportional to the EWM of the L2 norm of allocation changes.
+
+**Purpose:** To promote a stable, long-term strategy by discouraging erratic, high-frequency changes in allocation. This is the primary long-term smoothing mechanism.
+
+**Formula:**
+\[
+R_{\text{consist}, t} = -\lambda_{\text{smooth}} \cdot \bar{L}_{2,t}^{\text{ewm}}
+\]
+where \(\lambda_{\text{smooth}}\) is the smoothness weight (`TEMPORAL_SMOOTHNESS_WEIGHT`) and \(\bar{L}_{2,t}^{\text{ewm}}\) is the EWM of the mean squared allocation change.
+
+#### **e. Momentum Reward (\( R_{\text{momentum}, t} \))**
+A dynamic reward that encourages trend-following during profitable periods and strategy adaptation during losing periods.
+
+**Purpose:** To teach the agent to "let winners run" and "cut losers short."
+
+**Formula:**
+\[
+R_{\text{momentum}, t} = \begin{cases} \min(0.02, 10 \cdot \bar{r}^{\text{ewm}}_t \cdot \bar{T}^{\text{ewm}}_t) & \text{if } \bar{r}^{\text{ewm}}_t > \tau_{\text{profit}} \\ 0.01 \cdot \min(1.0, 100 \cdot \bar{L}_{2,t}^{\text{ewm}}) & \text{if } \bar{r}^{\text{ewm}}_t < -\tau_{\text{profit}} \text{ and } \bar{L}_{2,t}^{\text{ewm}} > \tau_{\text{change}} \\ 0 & \text{otherwise} \end{cases}
+\]
+where \(\bar{T}^{\text{ewm}}_t\) is the EWM of trend consistency and \(\tau\) represents small threshold values.
+
+---
+
+### **3. Long-Term Bonus (\( R_{\text{longterm}, t} \))**
+
+A bonus reward based on the portfolio's return over a long lookback window \(N\).
+
+**Purpose:** To provide a sparse but powerful signal that encourages strategies leading to significant long-term growth, counteracting myopic, short-term decision-making.
+
+**Formula:**
+\[
+R_{\text{longterm}, t} = \frac{\lambda_{\text{long}}}{N} \cdot \frac{V_t - V_{t-N}}{V_{t-N}}
+\]
+where \( \lambda_{\text{long}} \) is the bonus weight and \(N\) is the lookback period.
+
+---
+
+### **4. Jitter Penalty (\( P_{\text{jitter}, t} \))**
+
+A penalty based on the Total Variation (L2 norm) of allocation changes over a shorter, fixed-size window.
+
+**Purpose:** To prevent rapid, high-frequency "thrashing" or "spiky" allocations within a short time horizon. This is the primary short-term jitter control.
+
+**Formula:**
+\[
+P_{\text{jitter}, t} = \frac{\lambda_{\text{TV}}}{W_{\text{TV}}} \sum_{j=t-W_{\text{TV}}+1}^{t} \left( \text{mean}((w_j - w_{j-1})^2) \right)
+\]
+where \( \lambda_{\text{TV}} \) is the TV weight and \( W_{\text{TV}} \) is the TV window size.
+
+***

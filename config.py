@@ -54,10 +54,10 @@ FEATURES_PER_COIN = len(SCOLS)  # Now 28 features per coin (was 14)
 # =============================================================================
 
 # Temporal smoothness penalty weight (applied in reward function, not action space)
-TEMPORAL_SMOOTHNESS_WEIGHT = 0.1  # Weight for L2 penalty on allocation changes
+TEMPORAL_SMOOTHNESS_WEIGHT = 0.3  # Weight for L2 penalty on allocation changes
 
 # Smoothing window length 
-SMOOTHING_WINDOW = 5  # Number of previous steps to consider for smoothness
+SMOOTHING_WINDOW = 30  # Number of previous steps to consider for smoothness
 
 # # Volatility-adjusted smoothing
 # VOLATILITY_SCALING = False  # Enable volatility-adjusted smoothness penalty
@@ -249,13 +249,13 @@ REWARD_SCALE_FACTOR = 1.0
 TRANSACTION_COST = 0.02
 
 # Volatility penalty weight
-VOLATILITY_PENALTY_WEIGHT = 1.0  # Add this: Controls the penalty for large allocation changes.
+VOLATILITY_PENALTY_WEIGHT = 0.5  # Add this: Controls the penalty for large allocation changes.
 # A higher value encourages smoother, more stable allocation strategies.
 
 # Long-term performance bonus parameters
 LONG_TERM_BONUS_ENABLED = True  # Enable/disable long-term performance bonus
 LONG_TERM_LAMBDA = 1.5  # λ_long: Weight for long-term performance bonus
-LONG_TERM_LOOKBACK = 30  # N: Number of steps to look back for long-term comparison
+LONG_TERM_LOOKBACK = 15  # N: Number of steps to look back for long-term comparison
 # Formula: r_t' = r_t + λ_long * (1/N) * (V_t - V_{t-N}) / V_{t-N}
 
 # --- NEW: Shapley Value Parameters ---
@@ -265,8 +265,8 @@ SHAPLEY_SAMPLES = 64  # Number of Monte Carlo samples for Shapley value calculat
 STRUCTURED_REWARD_SCALING_FACTOR = 5.0 # Beta for tanh squashing of returns
 
 # --- NEW: Total Variation Penalty for Thrashing ---
-TV_WINDOW = 10                  # Number of past steps to consider for thrashing
-TV_WEIGHT = 2.5                 # Weight for the TV penalty
+TV_WINDOW = 30                  # Number of past steps to consider for thrashing
+TV_WEIGHT = 1.5                 # Weight for the TV penalty
 
 # --- REVISED: Symmetric Drawdown Reward/Penalty (Tuned for Intraday Trading) ---
 # This provides a continuous reward for staying near the peak portfolio value
