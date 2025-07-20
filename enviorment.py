@@ -722,16 +722,7 @@ class PortfolioEnv(gym.Env):
         elif self.reward_type == "POMDP":
             # --- POMDP-Aware Reward: EWM-Smoothed State Transitions ---
             
-            # 🎯 STRATEGY: Use Exponentially Weighted Moving Averages (EWM) for:
-            # 1. Smooth state transitions (reduce single-step reactivity)
-            # 2. Directional understanding (trend-based signals)
-            # 3. Robust risk assessment (smoothed volatility)
-            
-            # Calculate immediate step return as base
-            if self.previous_value > 1e-9:
-                step_return = (self.current_value - self.previous_value) / self.previous_value
-            else:
-                step_return = 0.0
+            base_reward = step_return  # Keep immediate return as base signal
             
             # ✅ UPDATE: Initialize and update EWM tracking
             if self.ewm_returns is None:
@@ -778,35 +769,66 @@ class PortfolioEnv(gym.Env):
             else:
                 active_allocation = agent_allocation
             
-            # 1. DIFFERENTIAL ALLOCATION REWARD (EWM-based) + EXPLORATION BONUSES
+            # 1. DIFFERENTIAL ALLOCATION REWARD (EWM-based)
             # Reward smart allocation decisions using smoothed signals
+            differential_reward = 0.0
             
-            # --- Scaled Diversity Bonus ---
-            # Incentivize the agent to use more assets instead of collapsing to a 2-asset portfolio.
-            # The bonus scales with the number of assets that have a meaningful allocation.
-            num_active_assets = np.sum(active_allocation > 0.05)
-            # We subtract 1 because a 1-asset portfolio (100% cash) is the baseline.
-            # The exponent creates a non-linear, increasing reward for using more assets.
-            diversity_bonus = config.DIVERSITY_BONUS_WEIGHT * ((num_active_assets - 1) / (self.n_episode_coins)) ** 2
-            
-            # --- Entropy Bonus ---
-            # Penalize low-entropy (overly-confident, "spiky") allocations.
-            # This encourages the agent to explore more varied allocation strategies.
-            # Add a small epsilon to prevent log(0).
-            entropy = -np.sum(active_allocation * np.log(active_allocation + 1e-9))
-            entropy_bonus = config.ENTROPY_BONUS_WEIGHT * entropy
-            
-            # Cash safe haven incentive using EWM trends (SMOOTHED)
-            cash_incentive = 0.0
-            if self.ewm_returns < -0.002:  # If EWM average return < -0.2%
-                cash_allocation = active_allocation[0]  # First element is cash
-                # Reward higher cash allocation during poor crypto performance (EWM-based)
-                cash_incentive = cash_allocation * 0.01 * abs(self.ewm_returns)
+            # Baseline reward for reasonable allocation spread (unchanged - this is static)
+            non_zero_assets = np.sum(active_allocation > 0.05)  # Assets with >5% allocation
+            if non_zero_assets >= 2:  # At least 2 assets with meaningful allocation
+                baseline_reward = 0.005
+            else:
+                baseline_reward = 0.0
+
+            differential_reward = baseline_reward
+
+            # --- NEW: Structured Credit Assignment & Cash Reward ---
+            # This section incentivizes exploring high-performing assets and correctly
+            # rewards holding cash based on market opportunity cost.
+            credit_assignment_reward = 0.0
+            cash_reward = 0.0
+            avg_market_performance = 0.0
+
+            if len(self.price_history) >= config.LONG_TERM_LOOKBACK:
+                # 1. Get agent's average allocation over the lookback window.
+                allocation_window = np.array(self.agent_allocation_history[-config.LONG_TERM_LOOKBACK:])
+                avg_allocations = np.mean(allocation_window, axis=0)
+                avg_cash_allocation = avg_allocations[0]
+                avg_risky_allocations = avg_allocations[1 : self.n_episode_coins + 1]
+
+                # 2. Calculate per-asset risk-adjusted performance (Sharpe Ratio).
+                asset_performance = []
+                for coin in self.episode_coins:
+                    price_series = [p.get(coin, np.nan) for p in self.price_history]
+                    price_series = pd.Series(price_series).dropna()
+
+                    if len(price_series) > 1:
+                        step_returns = price_series.pct_change().dropna()
+                        if len(step_returns) > 1:
+                            mean_return = step_returns.mean()
+                            std_dev_return = step_returns.std()
+                            sharpe_ratio = mean_return / (std_dev_return + 1e-9)
+                            asset_performance.append(np.tanh(sharpe_ratio)) # Squash the value
+                        else:
+                            asset_performance.append(0.0)
+                    else:
+                        asset_performance.append(0.0)
+
+                # 3. Structured Credit Reward (Allocation * Performance).
+                # ✅ REFACTORED: Use an explicit loop to perfectly mirror the STRUCTURED_CREDIT logic.
+                total_credit_reward = 0.0
+                for i, coin_perf in enumerate(asset_performance):
+                    avg_alloc = avg_risky_allocations[i]
+                    reward_asset = avg_alloc * coin_perf
+                    total_credit_reward += reward_asset
                 
-                if cash_incentive > 1e-5:
-                    print(f"💰 Cash Safe Haven (EWM): ewm_return={self.ewm_returns:.4f}, cash_alloc={cash_allocation:.3f}, incentive={cash_incentive:.6f}")
-            
-            differential_reward = diversity_bonus + entropy_bonus + cash_incentive
+                # 4. Structured Cash Reward (Opportunity Cost-based).
+                if asset_performance:
+                    avg_market_performance = np.mean(asset_performance)
+                    cash_reward = avg_cash_allocation * max(-avg_market_performance, 0.0)
+                    total_credit_reward += cash_reward # Combine rewards
+                
+                credit_assignment_reward = total_credit_reward
 
             # 2. IMMEDIATE RISK-ADJUSTED REWARD (EWM-based Sharpe)
             # Use EWM values instead of recent window calculations
@@ -817,7 +839,7 @@ class PortfolioEnv(gym.Env):
             
             # Scale and bound the EWM Sharpe ratio
             risk_adjusted_reward = np.tanh(ewm_sharpe) * 0.01
-            
+
             # 3. TEMPORAL SMOOTHNESS REWARD (EWM-based)
             # Use EWM allocation changes instead of immediate window calculations
             temporal_smoothness_reward = 0.0
@@ -853,10 +875,8 @@ class PortfolioEnv(gym.Env):
                 if abs(momentum_reward) > 1e-5:
                     print(f"📈 Momentum (EWM): ewm_return={self.ewm_returns:.4f}, ewm_trend={self.ewm_trend_strength:.3f}, ewm_L2_penalty={self.ewm_l2_penalty:.6f}, reward={momentum_reward:.4f}")
 
-            # 5. COMBINE ALL COMPONENTS
-            base_reward = step_return  # Keep immediate return as base signal
             enhancement_reward = (differential_reward + risk_adjusted_reward + 
-                                 consistency_reward + momentum_reward)
+                                 consistency_reward + momentum_reward + credit_assignment_reward)
             
             raw_reward = base_reward + enhancement_reward + self.long_term_bonus - tv_penalty
             
@@ -867,15 +887,15 @@ class PortfolioEnv(gym.Env):
             if (abs(enhancement_reward) > 1e-5 or abs(self.long_term_bonus) > 1e-5):
                 print(f"🎯 POMDP Reward Breakdown (EWM-Smoothed):")
                 print(f"   Base Return: {base_reward:.4f}")
-                print(f"   Differential: {differential_reward:.4f} (Diversity={diversity_bonus:.4f}, Entropy={entropy_bonus:.4f}, Cash={cash_incentive:.4f})")
+                print(f"   Differential: {differential_reward:.4f} (baseline={baseline_reward:.4f})")
                 print(f"   Risk-Adj (EWM): {risk_adjusted_reward:.4f} (Sharpe={ewm_sharpe:.3f})")  
                 print(f"   Consistency (EWM): {consistency_reward:.4f}")
                 print(f"   Momentum (EWM): {momentum_reward:.4f}")
+                print(f"   Credit Assignment: {credit_assignment_reward:.4f}")
                 print(f"   Long-term: {self.long_term_bonus:.4f}")
                 print(f"   Jitter Penalty: {tv_penalty:.5f}")
                 print(f"   EWM State: returns={self.ewm_returns:.4f}, vol={self.ewm_volatility:.4f}, changes={self.ewm_l2_penalty:.4f}")
                 print(f"   Final: {self.step_reward:.4f}")
-
         elif self.previous_value > 1e-9:  # Avoid division by zero
             # Calculate gross return (percentage change in portfolio value)
             gross_return = step_return

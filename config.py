@@ -268,10 +268,6 @@ STRUCTURED_REWARD_SCALING_FACTOR = 5.0 # Beta for tanh squashing of returns
 TV_WINDOW = 10                  # Number of past steps to consider for thrashing
 TV_WEIGHT = 2.5                 # Weight for the TV penalty
 
-# --- NEW: Diversity and Entropy Bonuses for Exploration ---
-DIVERSITY_BONUS_WEIGHT = 1.0    # Scales the reward for using more assets
-ENTROPY_BONUS_WEIGHT = 0.01     # Scales the reward for creating less "spiky" allocations
-
 # --- REVISED: Symmetric Drawdown Reward/Penalty (Tuned for Intraday Trading) ---
 # This provides a continuous reward for staying near the peak portfolio value
 # and a penalty for falling away from it.
@@ -282,6 +278,10 @@ DRAWDOWN_EXPONENT = 1.5         # Softened exponent slightly to create a more li
 
 # Type of reward function to use: "simple", "TRANSACTION_COST", "STRUCTURED_CREDIT", "POMDP"
 REWARD_TYPE = "POMDP"
+
+# --- NEW: Per-Asset Credit Assignment (for POMDP) ---
+# This provides a reward gradient to incentivize allocating to high-performing but ignored assets.
+CREDIT_ASSIGNMENT_WEIGHT = 0.02 # Weight for the correlation-based opportunity cost reward
 
 # =============================================================================
 # UTILITY FUNCTIONS
