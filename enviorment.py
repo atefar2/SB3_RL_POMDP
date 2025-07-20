@@ -192,13 +192,26 @@ class PortfolioEnv(gym.Env):
         self.previous_money_split_ratio = self.money_split_ratio.copy() if hasattr(self, 'money_split_ratio') else None
         self.total_transaction_costs = 0.0
         
+        # 🔧 NEW: Initialize agent allocation tracking for POMDP rewards
+        self.previous_agent_allocation = self.money_split_ratio.copy() if hasattr(self, 'money_split_ratio') else None
+        self.agent_target_allocation = self.money_split_ratio.copy() if hasattr(self, 'money_split_ratio') else None
+        
+        # 🔧 NEW: Initialize agent allocation history for temporal smoothness
+        self.agent_allocation_history = [self.money_split_ratio.copy()] if hasattr(self, 'money_split_ratio') else []
+        
+        # 🔧 NEW: Initialize EWM tracking for POMDP smooth state transitions
+        self.ewm_alpha = 0.1  # EWM decay factor (0.1 = slow adaptation, 0.9 = fast adaptation)
+        self.ewm_returns = None  # EWM of returns for directional understanding
+        self.ewm_volatility = None  # EWM of volatility for risk assessment
+        self.ewm_l2_penalty = None  # EWM of L2 penalty for smoothness
+        self.ewm_trend_strength = None  # EWM of trend strength for momentum
+        
         # Initialize long-term performance tracking for bonus calculation
         self.portfolio_value_history = [self.current_value]  # Track portfolio values over time
         self.long_term_bonus = 0.0  # Current long-term bonus component
         
         # --- History for advanced reward calculations (Structured Credit, Shapley) ---
         self.shapley_lookback = config.LONG_TERM_LOOKBACK  # Use a consistent lookback window
-        self.allocation_history = []
         self.price_history = []
         self.return_history = deque(maxlen=config.LONG_TERM_LOOKBACK)
 
@@ -255,12 +268,21 @@ class PortfolioEnv(gym.Env):
             # If episode ended, reset environment
             return self.reset()
         
-        # 🎯 ESSENTIAL: Show agent's action
-        print(f"🎯 Agent Action: {action}")
+        # 🎯 ESSENTIAL: Show agent's raw action
+        print(f"🎯 Agent Raw Action: {action}")
         
         # Handle action based on portfolio type
         if self.use_variable_portfolio:
             action = self._apply_action_mask(action)
+        
+        # 🔧 REMOVED: Action smoothing moved to reward calculation for better learning
+        # Action smoothing in action space prevents learning - moved to reward space instead
+        
+        # Store previous allocation for reward calculation (AGENT DECISIONS, not market drift)
+        if hasattr(self, 'money_split_ratio'):
+            self.previous_agent_allocation = self.money_split_ratio.copy()
+        else:
+            self.previous_agent_allocation = None
         
         # Store previous allocation for transaction cost calculation
         if hasattr(self, 'money_split_ratio'):
@@ -286,8 +308,18 @@ class PortfolioEnv(gym.Env):
             else:
                 self.money_split_ratio = action / sum(action)
 
-        # 📊 ESSENTIAL: Show target allocation
-        print(f"📊 Target Allocation: {[f'{x:.3f}' for x in self.money_split_ratio]}")
+        # 🔧 NEW: Store agent's target allocation BEFORE market drift
+        self.agent_target_allocation = self.money_split_ratio.copy()
+        
+        # 🔧 NEW: Centralized allocation history management
+        # This is the single source of truth for the agent's decisions over time.
+        self.agent_allocation_history.append(self.agent_target_allocation.copy())
+
+        # Prune history to the maximum required lookback window (for Shapley, TV, etc.)
+        # This ensures all dependent calculations have enough data.
+        max_lookback = self.shapley_lookback + 1
+        if len(self.agent_allocation_history) > max_lookback:
+            self.agent_allocation_history = self.agent_allocation_history[-max_lookback:]
 
         self.current_stock_num_distribution = self.calculate_actual_shares_from_money_split()
         
@@ -332,8 +364,9 @@ class PortfolioEnv(gym.Env):
 
         reward = info["reward"]
         
-        # 💰 ESSENTIAL: Show results
-        print(f"💰 Portfolio: ${self.current_value:.2f} | Reward: {reward:.4f} | Actual: {[f'{x:.3f}' for x in self.money_split_ratio]}")
+        # 💰 ESSENTIAL: Show results (distinguish agent vs actual)
+        print(f"💰 Portfolio: ${self.current_value:.2f} | Reward: {reward:.4f}")
+        print(f"📈 Actual (post-drift): {[f'{x:.3f}' for x in self.money_split_ratio]}")
         
         # Check if episode is done (use correct episode length matching successful implementation)
         # Episodes run for EPISODE_LENGTH // n_coins time steps (constant data usage)
@@ -506,9 +539,8 @@ class PortfolioEnv(gym.Env):
         
         # --- Store history for structured rewards & Shapley values ---
         # The allocation to store is the one the agent decided on for this step
-        self.allocation_history.append(self.last_target_allocation)
-        if len(self.allocation_history) > self.shapley_lookback:
-            self.allocation_history.pop(0)
+        if len(self.agent_allocation_history) > self.shapley_lookback:
+            self.agent_allocation_history.pop(0)
 
         # Store current prices for the lookback calculation
         current_prices = self.dfslice[["coin", "open"]].set_index("coin").to_dict().get("open", {})
@@ -518,22 +550,34 @@ class PortfolioEnv(gym.Env):
         
         # --- NEW: Calculate Total Variation Penalty to prevent thrashing ---
         tv_penalty = 0.0
-        if self.reward_type != "POMDP" and len(self.tv_alloc_history) >= config.TV_WINDOW + 1:
+        if len(self.agent_allocation_history) >= config.TV_WINDOW + 1:
             total_variation = 0.0
-            for i in range(1, len(self.tv_alloc_history)):
-                prev = np.array(self.tv_alloc_history[i - 1])
-                curr = np.array(self.tv_alloc_history[i])
-                total_variation += np.sum(np.abs(curr - prev))
+            # Use the agent's actual decision history for TV calculation
+            windowed_history = self.agent_allocation_history[-(config.TV_WINDOW + 1):]
+            
+            for i in range(1, len(windowed_history)):
+                prev = np.array(windowed_history[i - 1])
+                curr = np.array(windowed_history[i])
+                
+                # ✅ CORRECTED: Use mean instead of sum to make penalty independent of portfolio size.
+                # This ensures the jitter penalty is an "average change per asset," which is a
+                # much fairer and more robust metric, just like we did for the L2 penalty.
+                abs_diff = np.abs(curr - prev)
+                if self.use_variable_portfolio:
+                    # For variable portfolios, only consider active assets for a fair comparison
+                    active_diff = abs_diff[:self.n_episode_coins + 1]
+                    mean_diff = np.mean(active_diff)
+                else:
+                    mean_diff = np.mean(abs_diff)
+                
+                total_variation += mean_diff
             
             # Normalize by window size to get average change per step
             avg_variation = total_variation / config.TV_WINDOW
             tv_penalty = config.TV_WEIGHT * avg_variation
             
             if tv_penalty > 1e-5:
-                print(f"🌀 Total Variation Penalty: {tv_penalty:.5f}")
-        elif self.reward_type == "POMDP":
-            # For POMDP, we want to allow differential allocations without penalty
-            tv_penalty = 0.0
+                print(f"🌀 Total Variation Jitter Penalty: {tv_penalty:.5f}")
 
         # ✅ REWARD CALCULATION: Choose between Simple Return or Net Return (Profit minus Costs)
         if self.reward_type == "STRUCTURED_CREDIT":
@@ -555,7 +599,7 @@ class PortfolioEnv(gym.Env):
                 # --- CORRECTED STRUCTURED CREDIT USING SHARPE RATIO ---
                 
                 # 1. Get average allocation over the window (this is correct)
-                allocation_window = np.array(self.allocation_history)
+                allocation_window = np.array(self.agent_allocation_history) # Use agent_allocation_history
                 avg_allocations = np.mean(allocation_window, axis=0)
 
                 # 2. Calculate per-asset rewards using Sharpe Ratio
@@ -662,7 +706,7 @@ class PortfolioEnv(gym.Env):
 
         elif self.reward_type == "SHAPLEY":
             # --- Shapley Value Based Credit Assignment ---
-            if len(self.allocation_history) < self.shapley_lookback:
+            if len(self.agent_allocation_history) < self.shapley_lookback:
                 # Fallback to a dense reward during the cold-start period
                 self.step_reward = 0.0  # Or use simple return
             else:
@@ -676,12 +720,12 @@ class PortfolioEnv(gym.Env):
                     print(f"💎 Shapley Reward: {shapley_reward:.4f}, Clipped: {self.step_reward:.4f}")
 
         elif self.reward_type == "POMDP":
-            # --- POMDP-Aware Reward: Making Non-Markovian Signals Markovian ---
+            # --- POMDP-Aware Reward: EWM-Smoothed State Transitions ---
             
-            # 🎯 STRATEGY: Instead of non-Markovian rewards, we'll:
-            # 1. Include historical context in the STATE (making it observable)
-            # 2. Provide immediate proxy rewards that correlate with long-term goals
-            # 3. Remove the conflict with L2 regularization
+            # 🎯 STRATEGY: Use Exponentially Weighted Moving Averages (EWM) for:
+            # 1. Smooth state transitions (reduce single-step reactivity)
+            # 2. Directional understanding (trend-based signals)
+            # 3. Robust risk assessment (smoothed volatility)
             
             # Calculate immediate step return as base
             if self.previous_value > 1e-9:
@@ -689,125 +733,147 @@ class PortfolioEnv(gym.Env):
             else:
                 step_return = 0.0
             
-            # 1. DIFFERENTIAL ALLOCATION REWARD (REPLACES DIVERSITY)
-            # Reward smart allocation decisions rather than forced diversification
-            current_allocation = np.array(self.money_split_ratio)
-            if self.use_variable_portfolio:
-                active_allocation = current_allocation[:self.n_episode_coins + 1]
+            # ✅ UPDATE: Initialize and update EWM tracking
+            if self.ewm_returns is None:
+                # First step: initialize EWM values
+                self.ewm_returns = step_return
+                self.ewm_volatility = abs(step_return)
+                self.ewm_l2_penalty = 0.0
+                self.ewm_trend_strength = 0.0
             else:
-                active_allocation = current_allocation
-            
-            # Encourage differential allocation strategies
-            differential_reward = 0.0
-            
-            # Small baseline reward for reasonable allocation spread
-            # (prevents extreme all-in strategies but allows 0% allocations)
-            non_zero_assets = np.sum(active_allocation > 0.05)  # Assets with >5% allocation
-            if non_zero_assets >= 2:  # At least 2 assets with meaningful allocation
-                baseline_reward = 0.005  # Much smaller than old diversity reward
-            else:
-                baseline_reward = 0.0  # No reward for extreme concentration
-            
-            # Bonus for responsive allocation changes based on recent performance
-            responsiveness_bonus = 0.0
-            if (hasattr(self, 'previous_money_split_ratio') and 
-                self.previous_money_split_ratio is not None and
-                len(self.return_history) > 0):
+                # Update EWM values using exponential smoothing
+                self.ewm_returns = (1 - self.ewm_alpha) * self.ewm_returns + self.ewm_alpha * step_return
                 
-                last_return = list(self.return_history)[-1] if self.return_history else 0
-                allocation_change = np.sum(np.abs(active_allocation - np.array(self.previous_money_split_ratio[:len(active_allocation)])))
+                # EWM volatility (smoothed absolute deviations)
+                current_volatility = abs(step_return - self.ewm_returns)
+                self.ewm_volatility = (1 - self.ewm_alpha) * self.ewm_volatility + self.ewm_alpha * current_volatility
                 
-                # Reward significant changes when losing money (adaptation)
-                if last_return < -0.005 and allocation_change > 0.1:
-                    responsiveness_bonus = min(0.01, allocation_change * 0.05)
-                
-                # Reward maintaining good allocations when profitable
-                elif last_return > 0.005 and allocation_change < 0.05:
-                    responsiveness_bonus = 0.005
-            
-            differential_reward = baseline_reward + responsiveness_bonus
-            
-            # 2. IMMEDIATE RISK-ADJUSTED REWARD  
-            # Calculate immediate Sharpe-like ratio using recent returns
-            if len(self.return_history) > 1:
-                recent_returns = list(self.return_history)[-min(5, len(self.return_history)):]  # Last 5 steps
-                mean_return = np.mean(recent_returns)
-                std_return = np.std(recent_returns)
-                
-                if std_return > 1e-9:
-                    immediate_sharpe = mean_return / std_return
-                else:
-                    immediate_sharpe = mean_return / 1e-9
-                
-                # Scale and bound the Sharpe ratio
-                risk_adjusted_reward = np.tanh(immediate_sharpe) * 0.01
-            else:
-                risk_adjusted_reward = 0.0
-            
-            # 3. ALLOCATION CONSISTENCY REWARD (MINIMAL & CONDITIONAL)
-            # Very small reward for reasonable changes, only during strong profitability
-            consistency_reward = 0.0
-            if (hasattr(self, 'previous_money_split_ratio') and 
-                self.previous_money_split_ratio is not None):
-                
-                allocation_change = np.sum(np.abs(current_allocation - np.array(self.previous_money_split_ratio)))
-                
-                # MINIMAL APPROACH: Only reward consistency during strong profit periods
-                if len(self.return_history) > 0:
-                    last_return = list(self.return_history)[-1] if self.return_history else 0
-                    
-                    # Only during strong profitability (much higher threshold)
-                    if last_return > 0.01:  # Only when return > 1%
-                        # Extremely small scale: 0.0005 instead of 0.001 (2x smaller again)
-                        base_consistency = max(0, (1.0 - allocation_change)) * 0.0005
-                        consistency_reward = base_consistency
-                
-                # Debug output for consistency reward
-                if consistency_reward > 0:  # Only log when there's actual reward
-                    print(f"🔄 Consistency: change={allocation_change:.3f}, reward={consistency_reward:.6f}")
+                # ✅ CORRECTED: EWM of the L2 penalty, calculated correctly.
+                # This now matches the TD3 implementation's logic.
+                if len(self.agent_allocation_history) >= 2:
+                    prev_alloc = np.array(self.agent_allocation_history[-2])
+                    curr_alloc = np.array(self.agent_allocation_history[-1])
 
-            # 4. MOMENTUM REWARD
-            # Reward for following profitable trends (immediate signal for long-term thinking)
+                    # Calculate the squared difference and then take the mean.
+                    squared_diff = (curr_alloc - prev_alloc) ** 2
+                    
+                    if self.use_variable_portfolio:
+                        active_squared_diff = squared_diff[:self.n_episode_coins + 1]
+                        l2_penalty = np.mean(active_squared_diff)
+                    else:
+                        l2_penalty = np.mean(squared_diff)
+
+                    self.ewm_l2_penalty = (1 - self.ewm_alpha) * self.ewm_l2_penalty + self.ewm_alpha * l2_penalty
+                
+                # EWM trend strength (consistency of recent returns)
+                if len(self.return_history) >= 3:
+                    recent_returns = list(self.return_history)[-3:]
+                    trend_consistency = 1.0 - np.std(recent_returns)  # Higher when returns are consistent
+                    self.ewm_trend_strength = (1 - self.ewm_alpha) * self.ewm_trend_strength + self.ewm_alpha * trend_consistency
+            
+            # 🔧 FIXED: Use agent's target allocation, not market-drifted allocation
+            agent_allocation = np.array(self.agent_target_allocation)
+            if self.use_variable_portfolio:
+                active_allocation = agent_allocation[:self.n_episode_coins + 1]
+            else:
+                active_allocation = agent_allocation
+            
+            # 1. DIFFERENTIAL ALLOCATION REWARD (EWM-based) + EXPLORATION BONUSES
+            # Reward smart allocation decisions using smoothed signals
+            
+            # --- Scaled Diversity Bonus ---
+            # Incentivize the agent to use more assets instead of collapsing to a 2-asset portfolio.
+            # The bonus scales with the number of assets that have a meaningful allocation.
+            num_active_assets = np.sum(active_allocation > 0.05)
+            # We subtract 1 because a 1-asset portfolio (100% cash) is the baseline.
+            # The exponent creates a non-linear, increasing reward for using more assets.
+            diversity_bonus = config.DIVERSITY_BONUS_WEIGHT * ((num_active_assets - 1) / (self.n_episode_coins)) ** 2
+            
+            # --- Entropy Bonus ---
+            # Penalize low-entropy (overly-confident, "spiky") allocations.
+            # This encourages the agent to explore more varied allocation strategies.
+            # Add a small epsilon to prevent log(0).
+            entropy = -np.sum(active_allocation * np.log(active_allocation + 1e-9))
+            entropy_bonus = config.ENTROPY_BONUS_WEIGHT * entropy
+            
+            # Cash safe haven incentive using EWM trends (SMOOTHED)
+            cash_incentive = 0.0
+            if self.ewm_returns < -0.002:  # If EWM average return < -0.2%
+                cash_allocation = active_allocation[0]  # First element is cash
+                # Reward higher cash allocation during poor crypto performance (EWM-based)
+                cash_incentive = cash_allocation * 0.01 * abs(self.ewm_returns)
+                
+                if cash_incentive > 1e-5:
+                    print(f"💰 Cash Safe Haven (EWM): ewm_return={self.ewm_returns:.4f}, cash_alloc={cash_allocation:.3f}, incentive={cash_incentive:.6f}")
+            
+            differential_reward = diversity_bonus + entropy_bonus + cash_incentive
+
+            # 2. IMMEDIATE RISK-ADJUSTED REWARD (EWM-based Sharpe)
+            # Use EWM values instead of recent window calculations
+            if self.ewm_volatility > 1e-9:
+                ewm_sharpe = self.ewm_returns / self.ewm_volatility
+            else:
+                ewm_sharpe = self.ewm_returns / 1e-9
+            
+            # Scale and bound the EWM Sharpe ratio
+            risk_adjusted_reward = np.tanh(ewm_sharpe) * 0.01
+            
+            # 3. TEMPORAL SMOOTHNESS REWARD (EWM-based)
+            # Use EWM allocation changes instead of immediate window calculations
+            temporal_smoothness_reward = 0.0
+            
+            # Apply smoothed L2 penalty using EWM allocation changes
+            if self.ewm_l2_penalty is not None:
+                smoothness_weight = config.TEMPORAL_SMOOTHNESS_WEIGHT
+                # ✅ CORRECTED: Apply the smoothed L2 penalty directly.
+                # The value is already an EWM of the squared penalties, so we don't square it again.
+                temporal_smoothness_reward = -smoothness_weight * self.ewm_l2_penalty
+                
+                # Debug output for temporal smoothness
+                if abs(temporal_smoothness_reward) > 1e-5:
+                    print(f"🔄 Temporal Smoothness (EWM): ewm_L2_penalty={self.ewm_l2_penalty:.6f}, weight={smoothness_weight:.4f}, reward={temporal_smoothness_reward:.6f}")
+            
+            consistency_reward = temporal_smoothness_reward
+
+            # 4. MOMENTUM REWARD (EWM-based)
+            # Use EWM trend strength instead of immediate calculations
             momentum_reward = 0.0
-            if len(self.return_history) >= 3:
-                recent_trend = list(self.return_history)[-3:]
-                
-                # Calculate trend strength instead of binary conditions
-                avg_recent_return = np.mean(recent_trend)
-                trend_consistency = 1.0 - np.std(recent_trend)  # Higher when returns are consistent
-                
-                if avg_recent_return > 0.001:  # Profitable trend
-                    # Reward for continuing profitable trends (scaled by consistency)
-                    momentum_reward = min(0.02, avg_recent_return * trend_consistency * 10)
-                elif avg_recent_return < -0.001:  # Losing trend
-                    # Reward for making changes to break losing streaks
-                    if allocation_change > 0.2:  # Significant adaptive change
-                        adaptation_strength = min(1.0, allocation_change)  # Cap at 1.0
+            
+            if self.ewm_trend_strength is not None and self.ewm_returns is not None:
+                if self.ewm_returns > 0.001:  # Profitable EWM trend
+                    # Reward for continuing profitable trends (EWM-based)
+                    momentum_reward = min(0.02, self.ewm_returns * self.ewm_trend_strength * 10)
+                elif self.ewm_returns < -0.001:  # Losing EWM trend
+                    # Reward for making changes to break losing streaks (EWM-based)
+                    if self.ewm_l2_penalty > 0.0001:  # Use small threshold for L2 penalty
+                        adaptation_strength = min(1.0, self.ewm_l2_penalty * 100) # Scale up since L2 is small
                         momentum_reward = adaptation_strength * 0.01
                 
                 # Debug output for momentum reward
                 if abs(momentum_reward) > 1e-5:
-                    print(f"📈 Momentum: avg_return={avg_recent_return:.4f}, consistency={trend_consistency:.3f}, change={allocation_change:.3f}, reward={momentum_reward:.4f}")
+                    print(f"📈 Momentum (EWM): ewm_return={self.ewm_returns:.4f}, ewm_trend={self.ewm_trend_strength:.3f}, ewm_L2_penalty={self.ewm_l2_penalty:.6f}, reward={momentum_reward:.4f}")
 
             # 5. COMBINE ALL COMPONENTS
-            base_reward = step_return  # Core return signal
+            base_reward = step_return  # Keep immediate return as base signal
             enhancement_reward = (differential_reward + risk_adjusted_reward + 
                                  consistency_reward + momentum_reward)
             
-            raw_reward = base_reward + enhancement_reward + self.long_term_bonus
+            raw_reward = base_reward + enhancement_reward + self.long_term_bonus - tv_penalty
             
             # Apply clipping
             self.step_reward = np.clip(raw_reward, -0.1, 0.1)
             
-            # Detailed logging for analysis
+            # Detailed logging for analysis (EWM values)
             if (abs(enhancement_reward) > 1e-5 or abs(self.long_term_bonus) > 1e-5):
-                print(f"🎯 POMDP Reward Breakdown:")
+                print(f"🎯 POMDP Reward Breakdown (EWM-Smoothed):")
                 print(f"   Base Return: {base_reward:.4f}")
-                print(f"   Differential: {differential_reward:.4f}")
-                print(f"   Risk-Adj: {risk_adjusted_reward:.4f}")  
-                print(f"   Consistency: {consistency_reward:.4f}")
-                print(f"   Momentum: {momentum_reward:.4f}")
+                print(f"   Differential: {differential_reward:.4f} (Diversity={diversity_bonus:.4f}, Entropy={entropy_bonus:.4f}, Cash={cash_incentive:.4f})")
+                print(f"   Risk-Adj (EWM): {risk_adjusted_reward:.4f} (Sharpe={ewm_sharpe:.3f})")  
+                print(f"   Consistency (EWM): {consistency_reward:.4f}")
+                print(f"   Momentum (EWM): {momentum_reward:.4f}")
                 print(f"   Long-term: {self.long_term_bonus:.4f}")
+                print(f"   Jitter Penalty: {tv_penalty:.5f}")
+                print(f"   EWM State: returns={self.ewm_returns:.4f}, vol={self.ewm_volatility:.4f}, changes={self.ewm_l2_penalty:.4f}")
                 print(f"   Final: {self.step_reward:.4f}")
 
         elif self.previous_value > 1e-9:  # Avoid division by zero
@@ -895,7 +961,7 @@ class PortfolioEnv(gym.Env):
         initial_value = self.portfolio_value_history[0]
         
         # Get the average allocation over the window for the assets in our coalition
-        allocation_window = np.array(self.allocation_history)
+        allocation_window = np.array(self.agent_allocation_history) # Use agent_allocation_history
         avg_allocations = np.mean(allocation_window, axis=0)
 
         final_value = 0
@@ -1099,6 +1165,17 @@ class PortfolioEnv(gym.Env):
             augmented_features.append(np.min(returns_array))   # Worst return
             augmented_features.append(np.max(returns_array))   # Best return
         else:
+            augmented_features.extend([0.0, 0.0, 0.0, 0.0])
+        
+        # 4. ✅ NEW: EWM State Information (smooth directional signals)
+        # These provide the agent with smoothed trend information for better decision making
+        if hasattr(self, 'ewm_returns') and self.ewm_returns is not None:
+            augmented_features.append(self.ewm_returns)              # EWM returns (directional trend)
+            augmented_features.append(self.ewm_volatility)           # EWM volatility (risk level)
+            augmented_features.append(self.ewm_l2_penalty)           # EWM allocation changes (strategy stability)
+            augmented_features.append(self.ewm_trend_strength)       # EWM trend strength (confidence)
+        else:
+            # Initialize with zeros if EWM not yet available
             augmented_features.extend([0.0, 0.0, 0.0, 0.0])
         
         return np.array(augmented_features)

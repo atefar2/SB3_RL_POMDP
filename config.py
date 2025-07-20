@@ -49,6 +49,24 @@ for col in BASE_SCOLS:
 # Features per coin (calculated after SCOLS is defined)
 FEATURES_PER_COIN = len(SCOLS)  # Now 28 features per coin (was 14)
 
+# =============================================================================
+# TEMPORAL SMOOTHNESS CONFIGURATION (for POMDP reward-based smoothing)
+# =============================================================================
+
+# Temporal smoothness penalty weight (applied in reward function, not action space)
+TEMPORAL_SMOOTHNESS_WEIGHT = 0.1  # Weight for L2 penalty on allocation changes
+
+# Smoothing window length 
+SMOOTHING_WINDOW = 5  # Number of previous steps to consider for smoothness
+
+# # Volatility-adjusted smoothing
+# VOLATILITY_SCALING = False  # Enable volatility-adjusted smoothness penalty
+# VOLATILITY_THRESHOLD = 0.02  # 2% volatility threshold for scaling
+
+# # Smoothness penalty scaling factors
+# SMOOTHNESS_MIN_SCALE = 0.5  # Minimum scaling during high volatility
+# SMOOTHNESS_MAX_SCALE = 2.0  # Maximum scaling during low volatility
+
 # Original observation columns (for backward compatibility)
 OBS_COLS = ['DASH_vh', 'LTC_vh', 'STR_vh', 'DASH_vl', 'LTC_vl', 'STR_vl', 'DASH_vc', 'LTC_vc', 'STR_vc',
             'DASH_open_s', 'LTC_open_s', 'STR_open_s', 'DASH_volume_s', 'LTC_volume_s', 'STR_volume_s', 
@@ -248,7 +266,11 @@ STRUCTURED_REWARD_SCALING_FACTOR = 5.0 # Beta for tanh squashing of returns
 
 # --- NEW: Total Variation Penalty for Thrashing ---
 TV_WINDOW = 10                  # Number of past steps to consider for thrashing
-TV_WEIGHT = 0.5                 # Weight for the TV penalty
+TV_WEIGHT = 2.5                 # Weight for the TV penalty
+
+# --- NEW: Diversity and Entropy Bonuses for Exploration ---
+DIVERSITY_BONUS_WEIGHT = 1.0    # Scales the reward for using more assets
+ENTROPY_BONUS_WEIGHT = 0.01     # Scales the reward for creating less "spiky" allocations
 
 # --- REVISED: Symmetric Drawdown Reward/Penalty (Tuned for Intraday Trading) ---
 # This provides a continuous reward for staying near the peak portfolio value

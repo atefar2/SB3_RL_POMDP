@@ -596,8 +596,11 @@ if __name__ == '__main__':
         # "models/TD3_tf_agents_style_heavy_STRUCTURED_CREDIT_20250714_190911/checkpoints/model_70400_steps.zip"
         # "models/TD3_tf_agents_style_heavy_STRUCTURED_CREDIT_20250714_194641/checkpoints/model_57200_steps.zip"
         # "models/TD3_tf_agents_style_heavy_STRUCTURED_CREDIT_20250714_153933/checkpoints/model_62800_steps.zip"
+        # "models/TD3_tf_agents_style_heavy_SHAPLEY_20250719_141411/checkpoints/model_40000_steps.zip"
+    
 
-        "models/TD3_tf_agents_style_heavy_POMDP_20250719_155124/checkpoints/model_6000_steps.zip"
+        "models/TD3_tf_agents_style_heavy_POMDP_20250719_232400/checkpoints/model_6000_steps.zip"
+
     ]
     
     # Check which models exist
