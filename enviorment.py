@@ -854,19 +854,32 @@ class PortfolioEnv(gym.Env):
             # Use EWM trend strength instead of immediate calculations
             momentum_reward = 0.0
             
+            # --- REVISED MOMENTUM REWARD (Continuous & More Impactful) ---
+            # This version provides a denser and more meaningful signal to the agent.
+            MOMENTUM_SCALING_FACTOR = 0.05  # Controls the magnitude; can be moved to config.py
+            
             if self.ewm_trend_strength is not None and self.ewm_returns is not None:
-                if self.ewm_returns > 0.001:  # Profitable EWM trend
-                    # Reward for continuing profitable trends (EWM-based)
-                    momentum_reward = min(0.02, self.ewm_returns * self.ewm_trend_strength * 10)
-                elif self.ewm_returns < -0.001:  # Losing EWM trend
-                    # Reward for making changes to break losing streaks (EWM-based)
-                    if self.ewm_l2_penalty > 0.0001:  # Use small threshold for L2 penalty
-                        adaptation_strength = min(1.0, self.ewm_l2_penalty * 100) # Scale up since L2 is small
-                        momentum_reward = adaptation_strength * 0.01
+                # Squash the EWM return to get a trend direction from -1 to 1.
+                # The multiplication by 200 amplifies small returns so they don't get lost in tanh.
+                trend_direction = np.tanh(self.ewm_returns * 200)
+
+                if trend_direction > 0:
+                    # POSITIVE TREND: Reward for "letting winners run".
+                    # The reward is proportional to the trend's strength and its consistency.
+                    consistency_bonus = self.ewm_trend_strength  # Value from ~0 to 1
+                    momentum_reward = trend_direction * consistency_bonus
                 
-                # Debug output for momentum reward
-                if abs(momentum_reward) > 1e-5:
-                    print(f"📈 Momentum (EWM): ewm_return={self.ewm_returns:.4f}, ewm_trend={self.ewm_trend_strength:.3f}, ewm_L2_penalty={self.ewm_l2_penalty:.6f}, reward={momentum_reward:.4f}")
+                elif trend_direction < 0:
+                    # NEGATIVE TREND: Reward for "cutting losers short" by changing strategy.
+                    # 'change_magnitude' is close to 1 for large changes, and 0 for no change.
+                    change_magnitude = 1 - np.exp(-self.ewm_l2_penalty * 50)
+                    
+                    # The reward is proportional to how bad the trend is (abs(trend_direction))
+                    # and how much the agent is changing (change_magnitude).
+                    momentum_reward = abs(trend_direction) * change_magnitude
+
+            # Apply the final scaling
+            momentum_reward *= MOMENTUM_SCALING_FACTOR
 
             enhancement_reward = (differential_reward + risk_adjusted_reward + 
                                  consistency_reward + momentum_reward + credit_assignment_reward)
