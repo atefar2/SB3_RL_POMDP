@@ -527,7 +527,7 @@ class PortfolioEnv(gym.Env):
             # Calculate long-term bonus: λ_long * (1/N) * (V_t - V_{t-N}) / V_{t-N}
             if v_t_minus_n > 1e-9:  # Avoid division by zero
                 long_term_return = (v_t - v_t_minus_n) / v_t_minus_n
-                self.long_term_bonus = config.LONG_TERM_LAMBDA * long_term_return #* (1.0 / config.LONG_TERM_LOOKBACK) 
+                self.long_term_bonus = config.LONG_TERM_LAMBDA * long_term_return * (1.0 / config.LONG_TERM_LOOKBACK) 
                 
                 # Debug output for long-term bonus
                 if abs(self.long_term_bonus) > 0.001:  # Only log significant bonuses
@@ -580,7 +580,7 @@ class PortfolioEnv(gym.Env):
             
             # ✅ NEW: Symmetric TV Reward/Penalty instead of only penalty
             # Define a "baseline" variation level - changes below this get rewarded, above get penalized
-            baseline_variation = getattr(config, 'TV_BASELINE_VARIATION', 0.01)  # 1% baseline variation
+            baseline_variation = config.TV_BASELINE_VARIATION  # 1% baseline variation
             
             # Calculate deviation from baseline (positive = more thrashing, negative = more stable)
             variation_deviation = avg_variation - baseline_variation
@@ -607,7 +607,7 @@ class PortfolioEnv(gym.Env):
             change_volatility = np.std(np.array(self.allocation_change_history))
             
             # ✅ SYMMETRICAL: Reward for low volatility, penalize for high volatility
-            baseline_volatility = getattr(config, 'ALLOCATION_VOLATILITY_BASELINE', 0.01)
+            baseline_volatility = config.ALLOCATION_VOLATILITY_BASELINE
             volatility_deviation = change_volatility - baseline_volatility
             alloc_volatility_reward_penalty = -config.ALLOCATION_VOLATILITY_WEIGHT * volatility_deviation
             
@@ -1102,7 +1102,7 @@ class PortfolioEnv(gym.Env):
         shapley_values = np.zeros(n_assets)
         
         # Number of Monte Carlo samples. Higher is more accurate but slower.
-        num_samples = getattr(config, 'SHAPLEY_SAMPLES', 32)  # Tune this based on performance
+        num_samples = config.SHAPLEY_SAMPLES  # Tune this based on performance
 
         for _ in range(num_samples):
             # For each sample, create a random ordering (permutation) of the assets

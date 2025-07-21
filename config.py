@@ -267,11 +267,11 @@ STRUCTURED_REWARD_SCALING_FACTOR = 5.0 # Beta for tanh squashing of returns
 # --- NEW: Total Variation Penalty for Thrashing ---
 TV_WINDOW = 15                  # Number of past steps to consider for thrashing
 TV_WEIGHT = 2.5                 # Reduced weight to balance with stronger performance signals
-TV_BASELINE_VARIATION = 0.02    # Increased baseline: Allow more normal market-responsive changes
+TV_BASELINE_VARIATION = 0.01    # Increased baseline: Allow more normal market-responsive changes
 
 # --- NEW: Allocation Volatility Penalty ---
 ALLOCATION_VOLATILITY_WEIGHT = 1.0 # Weight for penalty on the std dev of allocation changes
-ALLOCATION_VOLATILITY_BASELINE = 0.005 # Baseline for volatility; below this is rewarded.
+ALLOCATION_VOLATILITY_BASELINE = 0.025 # Baseline for volatility; below this is rewarded. (Increased from 0.005)
 
 # --- REVISED: Symmetric Drawdown Reward/Penalty (Tuned for Intraday Trading) ---
 # This provides a continuous reward for staying near the peak portfolio value
