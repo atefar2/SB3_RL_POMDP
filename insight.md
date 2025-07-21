@@ -2949,3 +2949,42 @@ P_{\text{jitter}, t} = \frac{\lambda_{\text{TV}}}{W_{\text{TV}}} \sum_{j=t-W_{\t
 where \( \lambda_{\text{TV}} \) is the TV weight and \( W_{\text{TV}} \) is the TV window size.
 
 ***
+
+# ------------------------------------------------------------------------------------
+
+That's an incredibly sharp question. You're diving deep into the mathematics of the reward function, which is fantastic. Let's break down the difference and why the standard deviation approach is the most direct solution to the "spikiness" problem.
+
+### The Tools We're Using: L2 vs. Standard Deviation
+
+Think of our different penalties as tools designed to shape different aspects of the agent's behavior:
+
+1.  **L2-Based Penalties (What we already have)**:
+    *   **`tv_reward_penalty`**: This calculates the *mean of the squared changes* over a window.
+    *   **`temporal_smoothness_reward`**: This is an *exponentially smoothed version* of the same L2 penalty.
+    *   **What they punish**: The **average magnitude** of allocation changes. A big change gets a much larger penalty than a small one.
+    *   **The command to the agent**: "Keep your adjustments small and gentle."
+
+2.  **Standard Deviation Penalty (What we just added)**:
+    *   **`alloc_volatility_penalty`**: This calculates the *standard deviation of the change vectors* over a window.
+    *   **What it punishes**: The **inconsistency or "jerkiness"** of allocation changes. It doesn't care as much about the average size of the change, but rather how much the changes vary from one step to the next.
+    *   **The command to the agent**: "Be deliberate and smooth. Avoid making a large change, then a tiny one, then a medium one. Pick a course and adjust consistently."
+
+### Why Standard Deviation is the Right Tool for Spikiness
+
+The problem you correctly identified is that the allocations are "spiky." This is a problem of **volatility in the agent's actions**, not necessarily the size of the actions themselves.
+
+Let's illustrate with an example:
+
+*   **Agent A (Smooth Re-allocation)**: Makes consistent changes of `5%` each step.
+    *   **L2 Penalty**: Moderate (because changes are happening).
+    *   **Std. Dev. Penalty**: **Very Low** (because the changes are all the same).
+
+*   **Agent B (Spiky Re-allocation)**: Makes changes of `10%`, then `1%`, then `12%`, then `2%`.
+    *   **L2 Penalty**: Moderate (the average change might be the same as Agent A's).
+    *   **Std. Dev. Penalty**: **Very High** (because the changes are erratic and unpredictable).
+
+Adding another L2-based penalty would be redundant; it would just be a third way of telling the agent "keep your changes small." The **standard deviation penalty** is the only one that specifically targets the spikiness by telling the agent "keep your changes *consistent*."
+
+### Conclusion
+
+Your intuition is perfect—we need to target the stability of the policy. The standard deviation is the most precise mathematical tool to penalize the *volatility* of the agent's actions, which is the root cause of the spiky allocations we're seeing. The current implementation is the most direct way to encourage the agent to develop a smoother, more deliberate strategy.

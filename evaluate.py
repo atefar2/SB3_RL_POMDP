@@ -599,7 +599,7 @@ if __name__ == '__main__':
         # "models/TD3_tf_agents_style_heavy_SHAPLEY_20250719_141411/checkpoints/model_40000_steps.zip"
     
 
-        "models/TD3_tf_agents_style_heavy_POMDP_20250720_022055/checkpoints/model_62400_steps.zip"
+        "models/TD3_tf_agents_style_heavy_POMDP_20250720_183758/checkpoints/model_35600_steps.zip"
 
     ]
     
@@ -623,7 +623,18 @@ if __name__ == '__main__':
     # --- FIX: Create environment BEFORE loading the model ---
     print("🏗️  Creating evaluation environment...")
     # Infer reward type from model path to ensure consistency
-    reward_type = "TRANSACTION_COST" if "TRANSACTION_COST" in model_path.upper() else "simple"
+    model_path_upper = model_path.upper()
+    if "TRANSACTION_COST" in model_path_upper:
+        reward_type = "TRANSACTION_COST"
+    elif "STRUCTURED_CREDIT" in model_path_upper:
+        reward_type = "STRUCTURED_CREDIT"
+    elif "SHAPLEY" in model_path_upper:
+        reward_type = "SHAPLEY"
+    elif "POMDP" in model_path_upper:
+        reward_type = "POMDP"
+    else:
+        reward_type = "simple"
+        
     eval_env = PortfolioEnv(reward_type=reward_type)
     print(f"✅ Environment created with reward_type='{reward_type}'")
     print(f"   Observation space: {eval_env.observation_space}")
