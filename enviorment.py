@@ -601,14 +601,19 @@ class PortfolioEnv(gym.Env):
                 print(f"🌀 Total Variation {direction}: Variation={avg_variation:.5f}, Baseline={baseline_variation:.3f}, TV Effect={tv_reward_penalty:.5f}")
 
         # --- NEW: Allocation Volatility Penalty ---
-        alloc_volatility_penalty = 0.0
+        alloc_volatility_reward_penalty = 0.0
         if len(self.allocation_change_history) >= config.TV_WINDOW:
             # Calculate the standard deviation of the allocation change vectors
             change_volatility = np.std(np.array(self.allocation_change_history))
-            alloc_volatility_penalty = config.ALLOCATION_VOLATILITY_WEIGHT * change_volatility
             
-            if alloc_volatility_penalty > 1e-5:
-                print(f"⚡ Allocation Volatility Penalty: {alloc_volatility_penalty:.5f} (StdDev: {change_volatility:.5f})")
+            # ✅ SYMMETRICAL: Reward for low volatility, penalize for high volatility
+            baseline_volatility = getattr(config, 'ALLOCATION_VOLATILITY_BASELINE', 0.01)
+            volatility_deviation = change_volatility - baseline_volatility
+            alloc_volatility_reward_penalty = -config.ALLOCATION_VOLATILITY_WEIGHT * volatility_deviation
+            
+            if abs(alloc_volatility_reward_penalty) > 1e-5:
+                direction = "Reward" if alloc_volatility_reward_penalty > 0 else "Penalty"
+                print(f"⚡ Allocation Volatility {direction}: {alloc_volatility_reward_penalty:.5f} (StdDev: {change_volatility:.5f})")
 
         # ✅ REWARD CALCULATION: Choose between Simple Return or Net Return (Profit minus Costs)
         if self.reward_type == "STRUCTURED_CREDIT":
@@ -683,8 +688,8 @@ class PortfolioEnv(gym.Env):
                 avg_alloc_cash = avg_allocations[0]
                 if risky_asset_returns:
                     avg_market_return = np.mean(risky_asset_returns)
-                    # reward_cash = avg_alloc_cash * (-1 * avg_market_return)
-                    reward_cash = avg_alloc_cash * max(-avg_market_return, 0.0)
+                    # ✅ CORRECTED: Restore the opportunity cost penalty for holding cash in a bull market.
+                    reward_cash = avg_alloc_cash * (-1 * avg_market_return)
                     total_structured_reward += reward_cash
                     
                     if abs(reward_cash) > 1e-5:
@@ -727,7 +732,7 @@ class PortfolioEnv(gym.Env):
                 
                 # Subtract the risk penalty from the skill-based reward
                 risk_penalty = config.VOLATILITY_PENALTY_WEIGHT * downside_deviation
-                penalized_reward = raw_reward - risk_penalty + drawdown_reward - alloc_volatility_penalty
+                penalized_reward = raw_reward - risk_penalty + drawdown_reward + alloc_volatility_reward_penalty
 
                 # As requested, clip the final reward to prevent Q-value explosion
                 self.step_reward = np.clip(penalized_reward, -0.1, 0.1)
@@ -745,7 +750,7 @@ class PortfolioEnv(gym.Env):
                 shapley_reward = self._calculate_shapley_reward()
 
                 # As with other rewards, clipping is crucial for stability
-                self.step_reward = np.clip(shapley_reward - alloc_volatility_penalty, -0.1, 0.1)
+                self.step_reward = np.clip(shapley_reward + alloc_volatility_reward_penalty, -0.1, 0.1)
 
                 if abs(shapley_reward) > 1e-5:
                     print(f"💎 Shapley Reward: {shapley_reward:.4f}, Clipped: {self.step_reward:.4f}")
@@ -860,7 +865,8 @@ class PortfolioEnv(gym.Env):
                 # 4. Structured Cash Reward (Opportunity Cost-based).
                 if asset_performance:
                     avg_market_performance = np.mean(asset_performance)
-                    cash_reward = avg_cash_allocation * max(-avg_market_performance, 0.0)
+                    # ✅ CORRECTED: Restore the opportunity cost penalty for holding cash in a bull market.
+                    cash_reward = avg_cash_allocation * (-1 * avg_market_performance)
                     total_credit_reward += cash_reward # Combine rewards
                 
                 # ✅ BOOSTED: Increase credit assignment weight for stronger signal
@@ -940,7 +946,7 @@ class PortfolioEnv(gym.Env):
                 raw_score = (1 - drawdown) ** config.DRAWDOWN_EXPONENT
                 drawdown_reward = config.DRAWDOWN_REWARD_WEIGHT * (raw_score - crossover_value)
             
-            raw_reward = base_reward + enhancement_reward + self.long_term_bonus + tv_reward_penalty + drawdown_reward - alloc_volatility_penalty
+            raw_reward = base_reward + enhancement_reward + self.long_term_bonus + tv_reward_penalty + drawdown_reward + alloc_volatility_reward_penalty
             
             # Apply clipping
             self.step_reward = np.clip(raw_reward, -0.1, 0.1)
@@ -958,13 +964,13 @@ class PortfolioEnv(gym.Env):
                 print(f"     • Consistency (0.3x weight): {consistency_reward:.4f}")
                 print(f"     • TV Reward/Penalty: {tv_reward_penalty:.4f}")
                 print(f"     • Drawdown Reward: {drawdown_reward:.4f}")
-                print(f"     • Volatility Penalty: {alloc_volatility_penalty:.4f}")
+                print(f"     • Volatility Reward/Penalty: {alloc_volatility_reward_penalty:.4f}")
                 print(f"   📈 OTHER:")
                 print(f"     • Long-term: {self.long_term_bonus:.4f}")
                 
                 # Calculate signal strength ratio
                 performance_signal = abs(risk_adjusted_reward) + abs(credit_assignment_reward) + abs(momentum_reward) + abs(differential_reward)
-                stability_signal = abs(consistency_reward) + abs(tv_reward_penalty) + abs(drawdown_reward) + abs(alloc_volatility_penalty)
+                stability_signal = abs(consistency_reward) + abs(tv_reward_penalty) + abs(drawdown_reward) + abs(alloc_volatility_reward_penalty)
                 signal_ratio = performance_signal / (stability_signal + 1e-9)
                 
                 print(f"   ⚖️  Performance/Stability Ratio: {signal_ratio:.2f} (Target: >1.5)")
@@ -980,7 +986,7 @@ class PortfolioEnv(gym.Env):
                 transaction_cost_pct = (transaction_cost / self.previous_value if self.previous_value > 1e-9 else 0.0)
                 
                 # --- UPDATE: Include long-term bonus in final reward calculation ---
-                raw_reward = gross_return + self.long_term_bonus + tv_reward_penalty - alloc_volatility_penalty
+                raw_reward = gross_return + self.long_term_bonus + tv_reward_penalty + alloc_volatility_reward_penalty
                 
                 # ✅ REWARD CLIPPING FIX: Clip rewards to prevent Q-value explosion
                 # Portfolio percentage returns can occasionally spike during market events
@@ -996,7 +1002,7 @@ class PortfolioEnv(gym.Env):
                           f"Raw: {raw_reward:.4f}, Clipped: {self.step_reward:.4f}")
             else:
                 # Simple Return (original calculation) + long-term bonus
-                raw_reward = gross_return + self.long_term_bonus + tv_reward_penalty - alloc_volatility_penalty
+                raw_reward = gross_return + self.long_term_bonus + tv_reward_penalty + alloc_volatility_reward_penalty
                 
                 # ✅ REWARD CLIPPING FIX: Clip rewards to prevent Q-value explosion
                 self.step_reward = np.clip(raw_reward, -0.1, 0.1)  # Clip to ±10% per step max
@@ -1006,7 +1012,7 @@ class PortfolioEnv(gym.Env):
                           f"Raw: {raw_reward:.4f}, Clipped: {self.step_reward:.4f}")
         else:
             # Only long-term bonus if no value change
-            raw_reward = self.long_term_bonus + tv_reward_penalty - alloc_volatility_penalty
+            raw_reward = self.long_term_bonus + tv_reward_penalty + alloc_volatility_reward_penalty
             self.step_reward = np.clip(raw_reward, -0.1, 0.1)  # Clip to ±10% per step max
 
     def get_observations(self):
