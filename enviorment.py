@@ -208,6 +208,7 @@ class PortfolioEnv(gym.Env):
         self.ewm_volatility = None  # EWM of volatility for risk assessment
         self.ewm_l2_penalty = None  # EWM of L2 penalty for smoothness
         self.ewm_trend_strength = None  # EWM of trend strength for momentum
+        self.ewm_alloc_volatility = None # EWM of allocation volatility for dynamic baseline
         
         # Initialize long-term performance tracking for bonus calculation
         self.portfolio_value_history = [self.current_value]  # Track portfolio values over time
@@ -527,7 +528,7 @@ class PortfolioEnv(gym.Env):
             # Calculate long-term bonus: λ_long * (1/N) * (V_t - V_{t-N}) / V_{t-N}
             if v_t_minus_n > 1e-9:  # Avoid division by zero
                 long_term_return = (v_t - v_t_minus_n) / v_t_minus_n
-                self.long_term_bonus = config.LONG_TERM_LAMBDA * long_term_return * (1.0 / config.LONG_TERM_LOOKBACK) 
+                self.long_term_bonus = config.LONG_TERM_LAMBDA * long_term_return #* (1.0 / config.LONG_TERM_LOOKBACK) 
                 
                 # Debug output for long-term bonus
                 if abs(self.long_term_bonus) > 0.001:  # Only log significant bonuses
@@ -606,14 +607,24 @@ class PortfolioEnv(gym.Env):
             # Calculate the standard deviation of the allocation change vectors
             change_volatility = np.std(np.array(self.allocation_change_history))
             
-            # ✅ SYMMETRICAL: Reward for low volatility, penalize for high volatility
-            baseline_volatility = config.ALLOCATION_VOLATILITY_BASELINE
-            volatility_deviation = change_volatility - baseline_volatility
+            # --- FIXED HEURISTIC: Use a more conservative baseline approach ---
+            if self.ewm_alloc_volatility is None:
+                # Initialize with a conservative baseline that encourages stability
+                self.ewm_alloc_volatility = max(change_volatility * 1.5, 0.05)  # Start with higher baseline
+            else:
+                alpha = config.ALLOCATION_VOLATILITY_EWM_ALPHA
+                self.ewm_alloc_volatility = (1 - alpha) * self.ewm_alloc_volatility + alpha * change_volatility
+
+            # Use the higher of: dynamic EWM baseline OR fixed minimum threshold
+            fixed_minimum_baseline = 0.04  # Fixed threshold: above this = penalty
+            dynamic_baseline = max(self.ewm_alloc_volatility, fixed_minimum_baseline)
+            
+            volatility_deviation = change_volatility - dynamic_baseline
             alloc_volatility_reward_penalty = -config.ALLOCATION_VOLATILITY_WEIGHT * volatility_deviation
             
             if abs(alloc_volatility_reward_penalty) > 1e-5:
                 direction = "Reward" if alloc_volatility_reward_penalty > 0 else "Penalty"
-                print(f"⚡ Allocation Volatility {direction}: {alloc_volatility_reward_penalty:.5f} (StdDev: {change_volatility:.5f})")
+                print(f"⚡ Allocation Volatility {direction}: {alloc_volatility_reward_penalty:.5f} (Vol: {change_volatility:.4f} vs Baseline: {dynamic_baseline:.4f})")
 
         # ✅ REWARD CALCULATION: Choose between Simple Return or Net Return (Profit minus Costs)
         if self.reward_type == "STRUCTURED_CREDIT":
@@ -806,19 +817,11 @@ class PortfolioEnv(gym.Env):
                 active_allocation = agent_allocation
             
             # 1. DIFFERENTIAL ALLOCATION REWARD (EWM-based)
-            # ✅ IMPROVED: Make baseline reward performance-dependent rather than static
+            # ✅ REMOVED: This was an artificial diversification bonus that prevented the agent
+            # from making high-conviction, concentrated allocations. Removing it allows the
+            # agent to learn concentration when appropriate, relying on other risk metrics
+            # like Sharpe and Drawdown to manage the associated risk.
             differential_reward = 0.0
-            
-            # Baseline reward for reasonable allocation spread (now performance-adjusted)
-            non_zero_assets = np.sum(active_allocation > 0.05)  # Assets with >5% allocation
-            if non_zero_assets >= 2:  # At least 2 assets with meaningful allocation
-                # ✅ NEW: Scale baseline reward by recent EWM performance to encourage active management
-                performance_multiplier = 1.0 + np.tanh(self.ewm_returns * 100) * 0.5  # Range: 0.5 to 1.5
-                baseline_reward = 0.005 * performance_multiplier
-            else:
-                baseline_reward = 0.0
-
-            differential_reward = baseline_reward
 
             # --- NEW: Structured Credit Assignment & Cash Reward ---
             # This section incentivizes exploring high-performing assets and correctly
@@ -866,11 +869,17 @@ class PortfolioEnv(gym.Env):
                 if asset_performance:
                     avg_market_performance = np.mean(asset_performance)
                     # ✅ CORRECTED: Restore the opportunity cost penalty for holding cash in a bull market.
-                    cash_reward = avg_cash_allocation * (-1 * avg_market_performance)
+                    cash_reward = 0.0 # avg_cash_allocation * (-1 * avg_market_performance)
                     total_credit_reward += cash_reward # Combine rewards
+                    
+                    # ✅ ENHANCED: Add detailed cash reward debugging
+                    if abs(cash_reward) > 1e-5:
+                        direction = "REWARD" if cash_reward > 0 else "PENALTY"
+                        market_direction = "DOWN" if avg_market_performance < 0 else "UP"
+                        print(f"💵 Cash {direction}: {cash_reward:.4f} (CashAlloc: {avg_cash_allocation:.2f}, Market {market_direction}: {avg_market_performance:.3f})")
                 
                 # ✅ BOOSTED: Increase credit assignment weight for stronger signal
-                credit_assignment_weight = 2.0  # Increased to make performance-based decisions more rewarding
+                credit_assignment_weight = 5.0  # Increased to make performance-based decisions more rewarding
                 credit_assignment_reward = total_credit_reward * credit_assignment_weight
 
             # 2. IMMEDIATE RISK-ADJUSTED REWARD (EWM-based)
@@ -880,24 +889,41 @@ class PortfolioEnv(gym.Env):
             else:
                 ewm_sharpe = self.ewm_returns / 1e-9
             
-            # ✅ BOOSTED: Increase coefficient from 0.01 to 0.05 for stronger signal
-            risk_adjusted_reward = np.tanh(ewm_sharpe) * 0.05
+            # ✅ BUFFED: Increase coefficient to make Sharpe ratio a stronger signal.
+            risk_adjusted_reward = np.tanh(ewm_sharpe) * 0.1 # Was 0.05
 
             # 3. TEMPORAL SMOOTHNESS REWARD (EWM-based)
             # Use EWM allocation changes instead of immediate window calculations
             temporal_smoothness_reward = 0.0
             
-            # Apply smoothed L2 penalty using EWM allocation changes
+            # ✅ SYMMETRICAL REWARD: Provide a dense, continuous signal based on a dynamic baseline
             if self.ewm_l2_penalty is not None:
-                # ✅ REDUCED: Lower smoothness weight from 1.0 to 0.3 to reduce dominance
-                smoothness_weight = config.TEMPORAL_SMOOTHNESS_WEIGHT * 0.3
-                # ✅ CORRECTED: Apply the smoothed L2 penalty directly.
-                # The value is already an EWM of the squared penalties, so we don't square it again.
-                temporal_smoothness_reward = -smoothness_weight * self.ewm_l2_penalty
+                alpha = config.TEMPORAL_SMOOTHNESS_EWM_ALPHA
+                
+                # The "baseline" is the EWM of past L2 penalties. The agent is rewarded for being
+                # smoother than its own recent average.
+                dynamic_baseline = self.ewm_l2_penalty
+                
+                # Calculate the L2 penalty for the current step
+                if len(self.agent_allocation_history) >= 2:
+                    prev = np.array(self.agent_allocation_history[-2])
+                    curr = np.array(self.agent_allocation_history[-1])
+                    squared_diff = (curr - prev) ** 2
+                    if self.use_variable_portfolio:
+                        current_l2_penalty = np.mean(squared_diff[:self.n_episode_coins + 1])
+                    else:
+                        current_l2_penalty = np.mean(squared_diff)
+                else:
+                    current_l2_penalty = 0.0
+
+                # Calculate deviation from the dynamic baseline
+                deviation = current_l2_penalty - dynamic_baseline
+                temporal_smoothness_reward = -config.TEMPORAL_SMOOTHNESS_WEIGHT * deviation
                 
                 # Debug output for temporal smoothness
                 if abs(temporal_smoothness_reward) > 1e-5:
-                    print(f"🔄 Temporal Smoothness (EWM): ewm_L2_penalty={self.ewm_l2_penalty:.6f}, weight={smoothness_weight:.4f}, reward={temporal_smoothness_reward:.6f}")
+                    direction = "Reward" if temporal_smoothness_reward > 0 else "Penalty"
+                    print(f"🔄 Temporal Smoothness {direction}: {temporal_smoothness_reward:.5f} (L2: {current_l2_penalty:.4f} vs EWM-Baseline: {dynamic_baseline:.4f})")
             
             consistency_reward = temporal_smoothness_reward
 
@@ -907,8 +933,8 @@ class PortfolioEnv(gym.Env):
             
             # --- REVISED MOMENTUM REWARD (Continuous & More Impactful) ---
             # This version provides a denser and more meaningful signal to the agent.
-            # ✅ BOOSTED: Increase scaling from 0.05 to 0.15 for stronger signal
-            MOMENTUM_SCALING_FACTOR = 0.15  # Controls the magnitude; can be moved to config.py
+            # ✅ BUFFED: Increase scaling to make momentum a much stronger signal.
+            MOMENTUM_SCALING_FACTOR = 0.5  # Was 0.15
             
             if self.ewm_trend_strength is not None and self.ewm_returns is not None:
                 # Squash the EWM return to get a trend direction from -1 to 1.
@@ -933,7 +959,7 @@ class PortfolioEnv(gym.Env):
             # Apply the final scaling
             momentum_reward *= MOMENTUM_SCALING_FACTOR
 
-            enhancement_reward = (differential_reward + risk_adjusted_reward + 
+            enhancement_reward = (risk_adjusted_reward + 
                                  consistency_reward + momentum_reward + credit_assignment_reward)
             
             # --- NEW (from Structured Credit): Symmetric Drawdown Reward/Penalty ---
@@ -945,36 +971,69 @@ class PortfolioEnv(gym.Env):
                 crossover_value = (1 - config.DRAWDOWN_CROSSOVER) ** config.DRAWDOWN_EXPONENT
                 raw_score = (1 - drawdown) ** config.DRAWDOWN_EXPONENT
                 drawdown_reward = config.DRAWDOWN_REWARD_WEIGHT * (raw_score - crossover_value)
+
+            # --- NEW (from Structured Credit): Downside Volatility Risk Penalty ---
+            downside_returns = [r for r in self.return_history if r < 0]
+            if len(downside_returns) > 1:
+                downside_deviation = np.std(downside_returns)
+            else:
+                downside_deviation = 0.0
+            risk_penalty = (config.VOLATILITY_PENALTY_WEIGHT * downside_deviation)**2 
             
-            raw_reward = base_reward + enhancement_reward + self.long_term_bonus + tv_reward_penalty + drawdown_reward + alloc_volatility_reward_penalty
+            # --- REBALANCED REWARD STRUCTURE FOR STABILITY AND PROFITABILITY ---
+
+            # --- NEW: Separate the cash opportunity signal from other rewards ---
+            cash_opportunity_signal = 0.0
+            if 'asset_performance' in locals() and len(asset_performance) > 0:
+                avg_market_performance = np.mean(asset_performance)
+                # This is the core signal: penalizes cash in up-markets, rewards it in down-markets.
+                # It uses the original, correct opportunity cost logic.
+                cash_opportunity_signal = avg_cash_allocation * (-1 * avg_market_performance)
+
+
+            # 1. Core Profitability Signals (The Engine)
+            profit_signal = (base_reward + risk_adjusted_reward + self.long_term_bonus + 
+                             drawdown_reward + (cash_opportunity_signal * config.CASH_OPPORTUNITY_WEIGHT))
             
-            # Apply clipping
+            # 2. Stability & Risk-Aversion Signals (The Brakes - now with reduced weights)
+            # consistency_reward is the temporal_smoothness_reward
+            stability_signal = consistency_reward + tv_reward_penalty + alloc_volatility_reward_penalty - risk_penalty
+
+            # 3. Advanced Signals (Heavily Nerfed to act as fine-tuning)
+            nerf_factor = 0.5  # Reduce influence by 50%
+            # The original credit_assignment_reward is now used here without the cash component
+            advanced_signal = (momentum_reward + credit_assignment_reward) * nerf_factor
+            
+            # Final raw reward is a sum of these balanced components
+            raw_reward = profit_signal + stability_signal + advanced_signal
+            
+            # ✅ CRITICAL FIX: Clip to a smaller range to enable fine-grained learning
+            # This prevents reward saturation and allows the actor/critic to improve.
             self.step_reward = np.clip(raw_reward, -0.1, 0.1)
             
             # Detailed logging for analysis (EWM values)
             if (abs(enhancement_reward) > 1e-5 or abs(self.long_term_bonus) > 1e-5 or abs(tv_reward_penalty) > 1e-5):
+                
+                ratio = abs(profit_signal / (abs(stability_signal) + 1e-9))
+                
                 print(f"🎯 REBALANCED POMDP Reward Breakdown:")
                 print(f"   Base Return: {base_reward:.4f}")
-                print(f"   🎪 PERFORMANCE SIGNALS (Should Dominate):")
-                print(f"     • Risk-Adj (5x boost): {risk_adjusted_reward:.4f} (Sharpe={ewm_sharpe:.3f})")  
-                print(f"     • Credit Assignment (2x boost): {credit_assignment_reward:.4f}")
-                print(f"     • Momentum (3x boost): {momentum_reward:.4f}")
-                print(f"     • Differential (perf-based): {differential_reward:.4f}")
-                print(f"   🔧 STABILITY SIGNALS (Should Balance, Not Dominate):")
-                print(f"     • Consistency (0.3x weight): {consistency_reward:.4f}")
-                print(f"     • TV Reward/Penalty: {tv_reward_penalty:.4f}")
+                print(f"   📈 PROFIT SIGNALS: {profit_signal:.4f}")
+                print(f"     • Risk-Adj Return: {risk_adjusted_reward:.4f}")
                 print(f"     • Drawdown Reward: {drawdown_reward:.4f}")
-                print(f"     • Volatility Reward/Penalty: {alloc_volatility_reward_penalty:.4f}")
-                print(f"   📈 OTHER:")
-                print(f"     • Long-term: {self.long_term_bonus:.4f}")
+                print(f"     • Long-Term Bonus: {self.long_term_bonus:.4f}")
+                print(f"     • Cash Opportunity: {cash_opportunity_signal * config.CASH_OPPORTUNITY_WEIGHT:.4f}")
+                print(f"   🔧 STABILITY SIGNALS: {stability_signal:.4f}")
+                print(f"     • Consistency: {consistency_reward:.4f}")
+                print(f"     • TV Penalty: {tv_reward_penalty:.4f}")
+                print(f"     • Alloc Volatility: {alloc_volatility_reward_penalty:.4f}")
+                print(f"     • Downside Risk Penalty: {-risk_penalty:.4f}")
+                print(f"   💡 ADVANCED SIGNALS (Nerfed): {advanced_signal:.4f}")
+                print(f"     • Momentum: {momentum_reward * nerf_factor:.4f}")
+                print(f"     • Credit Assignment: {credit_assignment_reward * nerf_factor:.4f}")
+                print(f"   ⚖️  Profit/Stability Ratio: {ratio:.2f}")
+                print(f"   🎯 Final Clipped Reward: {self.step_reward:.4f} (Raw: {raw_reward:.4f})")
                 
-                # Calculate signal strength ratio
-                performance_signal = abs(risk_adjusted_reward) + abs(credit_assignment_reward) + abs(momentum_reward) + abs(differential_reward)
-                stability_signal = abs(consistency_reward) + abs(tv_reward_penalty) + abs(drawdown_reward) + abs(alloc_volatility_reward_penalty)
-                signal_ratio = performance_signal / (stability_signal + 1e-9)
-                
-                print(f"   ⚖️  Performance/Stability Ratio: {signal_ratio:.2f} (Target: >1.5)")
-                print(f"   🎯 Final: {self.step_reward:.4f}")
                 print(f"   📊 EWM State: returns={self.ewm_returns:.4f}, vol={self.ewm_volatility:.4f}, changes={self.ewm_l2_penalty:.4f}")
         elif self.previous_value > 1e-9:  # Avoid division by zero
             # Calculate gross return (percentage change in portfolio value)

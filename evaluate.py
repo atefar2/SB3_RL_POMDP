@@ -599,7 +599,7 @@ if __name__ == '__main__':
         # "models/TD3_tf_agents_style_heavy_SHAPLEY_20250719_141411/checkpoints/model_40000_steps.zip"
     
 
-        "models/TD3_tf_agents_style_heavy_POMDP_20250720_205718/checkpoints/model_4400_steps.zip"
+        "models/TD3_tf_agents_style_heavy_POMDP_20250721_040601/checkpoints/model_2000_steps.zip"
 
     ]
     

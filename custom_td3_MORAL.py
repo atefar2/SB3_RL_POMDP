@@ -18,6 +18,58 @@ from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.td3.policies import TD3Policy
 
+import gymnasium as gym
+
+class LinearScalarizationWrapper(gym.Wrapper):
+    def __init__(self, env, weights):
+        super().__init__(env)
+        self.weights = np.array(weights)
+    
+    def __getattr__(self, name):
+        """Forward attribute access to the wrapped environment."""
+        return getattr(self.env, name)
+
+    def step(self, action):
+        obs, reward_vector, terminated, truncated, info = self.env.step(action)
+        
+        # Handle both vectorized rewards and scalar rewards (e.g., at episode end)
+        if hasattr(reward_vector, '__len__') and len(reward_vector) > 1:
+            # Vectorized reward case
+            scalar_reward = np.dot(reward_vector, self.weights)
+            original_reward_vector = np.array(reward_vector)  # Ensure it's a numpy array
+        else:
+            # Scalar reward case (e.g., at episode termination)
+            scalar_reward = float(reward_vector)
+            original_reward_vector = np.array([scalar_reward, 0.0])  # Create dummy vector for consistency
+        
+        # Ensure scalar_reward is a Python float, not numpy array
+        # Handle all possible numpy array forms robustly
+        if np.isscalar(scalar_reward):
+            scalar_reward = float(scalar_reward)
+        elif hasattr(scalar_reward, 'size') and scalar_reward.size == 1:
+            scalar_reward = float(scalar_reward.flatten()[0])  # Handle any 1-element array
+        else:
+            # If somehow we get a multi-element array, sum it (shouldn't happen with proper dot product)
+            scalar_reward = float(np.sum(scalar_reward))
+        
+        # Update info to show the scalarized reward and components
+        info['original_reward_vector'] = original_reward_vector.copy()  # Keep original for debugging
+        info['scalarization_weights'] = self.weights.copy()
+        info['reward'] = scalar_reward  # Override with scalar reward
+        
+        # Debug logging (occasionally)
+        if np.random.rand() < 0.01:  # Log 1% of the time
+            if len(original_reward_vector) > 1:
+                print(f"🔄 LinearScalarizationWrapper: [{original_reward_vector[0]:.4f}, {original_reward_vector[1]:.4f}] -> {scalar_reward:.4f}")
+            else:
+                print(f"🔄 LinearScalarizationWrapper: {scalar_reward:.4f} (scalar)")
+        
+        return obs, scalar_reward, terminated, truncated, info
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        return obs, info
+
 
 class CustomTD3(TD3):
     """
@@ -83,89 +135,66 @@ class CustomTD3(TD3):
             device=device,
             _init_setup_model=_init_setup_model,
         )
+    """
+    Custom TD3 Agent that uses Huber Loss for the critic update.
+    This makes training more robust to outlier rewards.
+    """
 
     def train(self, gradient_steps: int, batch_size: int = 100) -> None:
-        """Enhanced training loop with entropy regularization for POMDP rewards."""
-        
-        # Check if environment uses POMDP reward for entropy regularization
-        env_reward_type = 'simple'  # Default fallback
-        
-        # Try different ways to access the underlying environment
-        if hasattr(self.env, 'envs') and hasattr(self.env.envs[0], 'reward_type'):
-            env_reward_type = getattr(self.env.envs[0], 'reward_type', 'simple')
-        elif hasattr(self.env, 'env') and hasattr(self.env.env, 'reward_type'):
-            env_reward_type = getattr(self.env.env, 'reward_type', 'simple')
-        elif hasattr(self.env, 'reward_type'):
-            env_reward_type = getattr(self.env, 'reward_type', 'simple')
-        
-        use_entropy_reg = env_reward_type == "POMDP"  # Only use entropy for POMDP
-        
-        # Debug logging to confirm detection (only log once per training session)
-        if not hasattr(self, '_reward_type_logged'):
-            print(f"🔧 CustomTD3: Detected reward_type='{env_reward_type}'")
-            if use_entropy_reg:
-                print(f"🎯 POMDP Mode: Using entropy regularization for exploration")
-            else:
-                print(f"📈 Standard Mode: No additional regularization")
-            self._reward_type_logged = True
-        
-        # Switch to train mode
+        """
+        Override the default training loop to use Huber loss for the critic.
+        """
+        # Switch to train mode (this affects batch norm / dropout)
         self.policy.set_training_mode(True)
+
+        # Update learning rate according to schedule
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
         actor_losses, critic_losses = [], []
         for _ in range(gradient_steps):
             self._n_updates += 1
+            # Sample replay buffer
             replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
 
             with torch.no_grad():
                 batch_size = replay_data.next_observations.shape[0]
-                action_dim = self.action_space.shape[0]
-                device = self.device
-
+                action_dim = self.action_space.shape[0] #action_dim = self.actor.action_dim  # Infer from actor
+                device = self.device                
+                # Select action according to policy and add clipped noise
                 noise = torch.normal(
                     mean=0.0,
                     std=self.target_policy_noise,
                     size=(batch_size, action_dim),
                     device=device
                 ).clamp(-self.target_noise_clip, self.target_noise_clip)
-
                 next_actions = (self.actor_target(replay_data.next_observations) + noise).clamp(-1, 1)
+
+                # Compute the target Q value
                 target_q_values = torch.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
                 target_q_values, _ = torch.min(target_q_values, dim=1, keepdim=True)
                 target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * target_q_values
 
-            # Critic update (same as before)
+            # Get current Q-values estimates
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
+
+            # ✅ HUBER LOSS: Compute critic loss using smooth_l1_loss (Huber loss)
+            # This is less sensitive to outliers than the default MSE loss.
             critic_loss = sum(F.smooth_l1_loss(current_q, target_q_values) for current_q in current_q_values)
             critic_losses.append(critic_loss.item())
 
+            # Optimize the critic
             self.critic.optimizer.zero_grad()
             critic_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.critic.optimizer.step()
 
-            # Actor update - CLEAN VERSION WITHOUT L2 REGULARIZATION
+            # Delayed policy updates
             if self._n_updates % self.policy_delay == 0:
-                obs = replay_data.observations
-                a_cur = self.actor(obs)
-                
-                # Standard TD3 actor objective
-                actor_loss = -self.critic.q1_forward(obs, a_cur).mean()
-                
-                # Optional entropy regularization for POMDP only
-                # if use_entropy_reg:
-                # Encourage exploration through entropy bonus
-                action_log_probs = torch.distributions.Normal(a_cur, 0.1).log_prob(a_cur).sum(dim=1)
-                entropy_bonus = 0.01 * action_log_probs.mean()  # Small entropy bonus
-                actor_loss = actor_loss - entropy_bonus  # Subtract because we want to maximize entropy
-                
-                # Periodic debug logging for entropy regularization
-                if self._n_updates % 1000 == 0:
-                    print(f"🎯 POMDP Entropy Regularization Applied: entropy_bonus={entropy_bonus.item():.6f}")
-                
+                # Compute actor loss
+                actor_loss = -self.critic.q1_forward(replay_data.observations, self.actor(replay_data.observations)).mean()
                 actor_losses.append(actor_loss.item())
 
+                # Optimize the actor
                 self.actor.optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)

@@ -54,10 +54,8 @@ FEATURES_PER_COIN = len(SCOLS)  # Now 28 features per coin (was 14)
 # =============================================================================
 
 # Temporal smoothness penalty weight (applied in reward function, not action space)
-TEMPORAL_SMOOTHNESS_WEIGHT = 1.0  # Weight for L2 penalty on allocation changes
-
-# Smoothing window length 
-SMOOTHING_WINDOW = 30  # Number of previous steps to consider for smoothness
+TEMPORAL_SMOOTHNESS_WEIGHT = 1.0  # REDUCED: Was 2.5, now more reasonable
+TEMPORAL_SMOOTHNESS_EWM_ALPHA = 0.05 # Alpha for the dynamic EWM baseline
 
 # # Volatility-adjusted smoothing
 # VOLATILITY_SCALING = False  # Enable volatility-adjusted smoothness penalty
@@ -249,8 +247,8 @@ REWARD_SCALE_FACTOR = 1.0
 TRANSACTION_COST = 0.02
 
 # Volatility penalty weight
-VOLATILITY_PENALTY_WEIGHT = 1.0  # Add this: Controls the penalty for large allocation changes.
-# A higher value encourages smoother, more stable allocation strategies.
+# --- BUFFED: Downside Risk Penalty (Sortino-like) ---
+VOLATILITY_PENALTY_WEIGHT = 0.5 # REDUCED: Was 1.0, now more balanced with other signals
 
 # Long-term performance bonus parameters
 LONG_TERM_BONUS_ENABLED = True  # Enable/disable long-term performance bonus
@@ -265,21 +263,21 @@ SHAPLEY_SAMPLES = 64  # Number of Monte Carlo samples for Shapley value calculat
 STRUCTURED_REWARD_SCALING_FACTOR = 5.0 # Beta for tanh squashing of returns
 
 # --- NEW: Total Variation Penalty for Thrashing ---
-TV_WINDOW = 15                  # Number of past steps to consider for thrashing
-TV_WEIGHT = 2.5                 # Reduced weight to balance with stronger performance signals
+TV_WINDOW = 30                  # Number of past steps to consider for thrashing
+TV_WEIGHT = 1.0                # REDUCED: Was 2.5, now more balanced
 TV_BASELINE_VARIATION = 0.01    # Increased baseline: Allow more normal market-responsive changes
 
 # --- NEW: Allocation Volatility Penalty ---
-ALLOCATION_VOLATILITY_WEIGHT = 1.0 # Weight for penalty on the std dev of allocation changes
-ALLOCATION_VOLATILITY_BASELINE = 0.025 # Baseline for volatility; below this is rewarded. (Increased from 0.005)
+ALLOCATION_VOLATILITY_WEIGHT = 1.0 # REDUCED: Was 2.0, now more reasonable
+ALLOCATION_VOLATILITY_EWM_ALPHA = 0.02 # REDUCED: Was 0.1, slower adaptation for more stable baseline
 
 # --- REVISED: Symmetric Drawdown Reward/Penalty (Tuned for Intraday Trading) ---
 # This provides a continuous reward for staying near the peak portfolio value
 # and a penalty for falling away from it.
 DRAWDOWN_WINDOW = 30            # Lookback window to calculate the peak portfolio value
-DRAWDOWN_REWARD_WEIGHT = 2.0    # Increased weight to make this signal stronger
-DRAWDOWN_CROSSOVER = 0.015      # Crossover at 1.5% drawdown. This is now highly sensitive.
-DRAWDOWN_EXPONENT = 1.5         # Softened exponent slightly to create a more linear response
+DRAWDOWN_CROSSOVER = 0.02       # Drawdown level where reward becomes penalty (2%)
+DRAWDOWN_EXPONENT = 2           # Exponential scaling factor
+DRAWDOWN_REWARD_WEIGHT = 0.5    # Weight for the drawdown reward
 
 # Type of reward function to use: "simple", "TRANSACTION_COST", "STRUCTURED_CREDIT", "POMDP"
 REWARD_TYPE = "POMDP"
@@ -287,6 +285,10 @@ REWARD_TYPE = "POMDP"
 # --- NEW: Per-Asset Credit Assignment (for POMDP) ---
 # This provides a reward gradient to incentivize allocating to high-performing but ignored assets.
 CREDIT_ASSIGNMENT_WEIGHT = 0.02 # Weight for the correlation-based opportunity cost reward
+
+# --- NEW: Standalone Cash Opportunity Cost Weight ---
+# This provides a strong, direct signal for managing cash based on market conditions.
+CASH_OPPORTUNITY_WEIGHT = 2.5   # Strong weight to encourage decisive cash allocation
 
 # =============================================================================
 # UTILITY FUNCTIONS
